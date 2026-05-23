@@ -95,7 +95,7 @@ pqr path/to/your/data.parquet
  
 MIT License
  
-Copyright (c) 2025 Matthew Abbott
+Copyright (c) 2026 Matthew Abbott
  
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
