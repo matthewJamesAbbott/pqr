@@ -21,8 +21,6 @@ class EditScreen(Screen[bool]):
         #ed-container {
             width: 60%;
             height: auto;
-            layout: vertical;
-            gap: 1;
         }
         #ed-label {
             color: $accent;
@@ -117,8 +115,11 @@ class ParquetReader(App[None]):
         self._dt: DataTable | None = None
         self._types: dict[str, str] = {}
         self._col_names: list[str] = []
+        self._col_keys: list = []
+        self._row_keys: list = []
         self._edited: dict[tuple[int, int], str] = {}
         self._origins: dict[tuple[int, int], str] = {}
+        self._raw: dict[tuple[int, int], str] = {}
 
     # -- mount ---------------------------------------------------------------
     def on_mount(self) -> None:
@@ -132,12 +133,18 @@ class ParquetReader(App[None]):
             zebra_stripes=True,
         )
 
-        for col in col_names:
-            dt.add_column(col)
+        self._col_keys = dt.add_columns(*col_names)
 
-        for idx in range(len(self._df)):
-            row = self._df.iloc[idx]
-            dt.add_row(*[self._fmt(v) for v in row.values])
+        self._row_keys = list(
+            dt.add_rows([
+                [self._fmt(v) for v in self._df.iloc[idx].values]
+                for idx in range(len(self._df))
+            ])
+        )
+
+        for ri in range(len(self._df)):
+            for ci, v in enumerate(self._df.iloc[ri].values):
+                self._raw[(ri, ci)] = self._full(v)
 
         self._dt = dt
         self.mount(dt)
@@ -149,6 +156,13 @@ class ParquetReader(App[None]):
     # -- helpers -------------------------------------------------------------
     @staticmethod
     def _fmt(v) -> str:
+        if pd.isna(v):
+            return ""
+        s = str(v)
+        return s[:200] if len(s) > 200 else s
+
+    @staticmethod
+    def _full(v) -> str:
         if pd.isna(v):
             return ""
         return str(v)
@@ -170,29 +184,24 @@ class ParquetReader(App[None]):
 
     # -- navigation ----------------------------------------------------------
     def action_down(self) -> None:
-        self._dt.cursor_down()
-        self._dt.ensure_visible(self._dt.cursor_coordinate)
+        self._dt.move_cursor(row=(self._dt.cursor_row or 0) + 1)
         self._update_status()
 
     def action_up(self) -> None:
-        self._dt.cursor_up()
-        self._dt.ensure_visible(self._dt.cursor_coordinate)
+        self._dt.move_cursor(row=(self._dt.cursor_row or 0) - 1)
         self._update_status()
 
     def action_left(self) -> None:
-        self._dt.cursor_left()
-        self._dt.ensure_visible(self._dt.cursor_coordinate)
+        self._dt.move_cursor(column=(self._dt.cursor_column or 0) - 1)
         self._update_status()
 
     def action_right(self) -> None:
-        self._dt.cursor_right()
-        self._dt.ensure_visible(self._dt.cursor_coordinate)
+        self._dt.move_cursor(column=(self._dt.cursor_column or 0) + 1)
         self._update_status()
 
     def action_home(self) -> None:
         if self._dt.row_count:
             self._dt.cursor_coordinate = (0, 0)
-        self._dt.ensure_visible(self._dt.cursor_coordinate)
         self._update_status()
 
     def action_end(self) -> None:
@@ -200,7 +209,6 @@ class ParquetReader(App[None]):
         nc = len(self._col_names)
         if nr and nc:
             self._dt.cursor_coordinate = (nr - 1, nc - 1)
-        self._dt.ensure_visible(self._dt.cursor_coordinate)
         self._update_status()
 
     def action_page_down(self) -> None:
@@ -233,9 +241,10 @@ class ParquetReader(App[None]):
             return
         ri, ci, display, rk, ck = info
         key = (ri, ci)
-        original = self._origins.get(key, display)
+        current = self._edited.get(key, self._raw.get(key, display))
+        original = self._origins.get(key, self._raw.get(key, display))
         self.push_screen(
-            EditScreen(self, ri, ci, display, original, rk, ck),
+            EditScreen(self, ri, ci, current, original, rk, ck),
             callback=self._edit_callback,
         )
         if append:
@@ -262,7 +271,9 @@ class ParquetReader(App[None]):
             self._origins[key] = original
         self._edited[key] = new_value
         dt = self._dt
-        dt.update_cell((row_idx, col_idx), new_value)
+        rkey = self._row_keys[row_idx]
+        ckey = self._col_keys[col_idx]
+        dt.update_cell(rkey, ckey, new_value)
         self._update_status()
 
     def _edit_callback(self, result: bool) -> None:
