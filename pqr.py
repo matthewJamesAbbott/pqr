@@ -1,3 +1,6 @@
+#!/home/matt/miniconda3/bin/python3
+"""pqr - Parquet Reader: vim-like viewer and editor for parquet files."""
+
 import sys
 from pathlib import Path
 
@@ -7,7 +10,40 @@ import pyarrow.parquet as pq
 from textual.app import App
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Input, Label
+from textual.widgets import DataTable, Footer, Input, Label, RichLog, Static
+
+
+class ViewCellScreen(Screen[None]):
+    """Overlay for viewing full cell contents."""
+
+    CSS = """
+        Screen {
+            align: center middle;
+            background: black 70%;
+        }
+        #view-container {
+            width: 80%;
+            height: 80%;
+            background: $surface;
+            border: solid $accent;
+            padding: 1;
+            overflow: auto;
+        }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+    ]
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self._text = text
+
+    def compose(self):
+        yield Static(self._text, id="view-container")
+
+    def action_close(self) -> None:
+        self.dismiss()
 
 
 class EditScreen(Screen[bool]):
@@ -41,6 +77,7 @@ class EditScreen(Screen[bool]):
         original: str,
         row_key: str,
         col_key: str,
+        append: bool = False,
     ) -> None:
         super().__init__()
         self._parent = parent
@@ -50,13 +87,17 @@ class EditScreen(Screen[bool]):
         self._original = original
         self._row_key = row_key
         self._col_key = col_key
+        self._append = append
 
     def compose(self):
         yield Label(f" [{self._col_key}]  row {self._row_idx}", id="ed-label")
         yield Input(id="ed-input", value=self._value)
 
     def on_mount(self) -> None:
-        self.query_one("#ed-input", Input).focus()
+        inp = self.query_one("#ed-input", Input)
+        inp.focus()
+        if self._append:
+            inp.cursor_position = len(inp.value)
 
     def action_confirm(self) -> None:
         new_val = self.query_one("#ed-input", Input).value
@@ -86,6 +127,7 @@ class ParquetReader(App[None]):
         Binding("i", "edit", "Edit"),
         Binding("e", "edit", "Edit"),
         Binding("a", "edit_append", "Append"),
+        Binding("v", "view_cell", "View"),
         Binding("w", "save", "Save"),
         Binding("q", "quit", "Quit"),
     ]
@@ -206,9 +248,9 @@ class ParquetReader(App[None]):
 
     def action_end(self) -> None:
         nr = self._dt.row_count
-        nc = len(self._col_names)
-        if nr and nc:
-            self._dt.cursor_coordinate = (nr - 1, nc - 1)
+        col = self._dt.cursor_column or 0
+        if nr:
+            self._dt.cursor_coordinate = (nr - 1, col)
         self._update_status()
 
     def action_page_down(self) -> None:
@@ -244,18 +286,25 @@ class ParquetReader(App[None]):
         current = self._edited.get(key, self._raw.get(key, display))
         original = self._origins.get(key, self._raw.get(key, display))
         self.push_screen(
-            EditScreen(self, ri, ci, current, original, rk, ck),
+            EditScreen(self, ri, ci, current, original, rk, ck, append),
             callback=self._edit_callback,
         )
-        if append:
-            inp = self.screen.query_one("#ed-input", Input)
-            inp.cursor_position = len(inp.value)
 
     def action_edit(self) -> None:
         self._open_edit(append=False)
 
     def action_edit_append(self) -> None:
         self._open_edit(append=True)
+
+    def action_view_cell(self) -> None:
+        dt = self._dt
+        if dt is None or dt.cursor_row is None or dt.cursor_column is None:
+            return
+        row_key = dt.cursor_row
+        col_key = dt.cursor_column
+        cell = dt.get_cell_at((row_key, col_key))
+        text_str = str(cell) if cell is not None else ""
+        self.push_screen(ViewCellScreen(text_str))
 
     def edit_cell(
         self,
@@ -277,14 +326,6 @@ class ParquetReader(App[None]):
         self._update_status()
 
     def _edit_callback(self, result: bool) -> None:
-        if not result:
-            info = self._get_cell()
-            if info:
-                ri, ci, display, _, _ = info
-                key = (ri, ci)
-                if key in self._edited:
-                    if self._edited[key] == self._origins.get(key, ""):
-                        del self._edited[key]
         self._update_status()
 
     # -- save ----------------------------------------------------------------
