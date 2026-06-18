@@ -2,6 +2,8 @@
 
 A fast, **Vim-like** terminal UI for browsing, searching, editing, and wrangling large collections of Parquet files.
 
+<still under development not all options are 100% stable yet>
+
 ![PQR 1](pqr1.png)
 
 ![PQR 2](pqr2.png)
