@@ -16,6 +16,8 @@ Built for people who actually live in their data — especially RAG pipelines, m
 
 ![PQR 3](pqr3.png)
 
+![PQR 4](pqr4.png)
+
 ---
 
 ## Features
