@@ -1,8 +1,15 @@
-# pqr — Parquet Viewer & Editor
+# pqr — Parquet Viewer & Editor for Power Users
 
-<p align="center">
-A fast, keyboard-driven terminal UI for inspecting and editing Apache Parquet files.
-</p>
+A fast, **Vim-like** terminal UI for browsing, searching, editing, and wrangling large collections of Parquet files.
+
+Built for people who actually live in their data — especially RAG pipelines, massive datasets, and local knowledge bases.
+
+**Unique superpowers:**
+- Browse entire directories of Parquets like a file manager
+- Global `/` search across your whole collection → `y` yank to clipboard
+- In-place cell editing with type safety
+- One-page-per-row book RAG workflows (DDC trees, summaries, metadata)
+
 
 ---
 
