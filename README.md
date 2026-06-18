@@ -1,4 +1,4 @@
-# pqr — Parquet Viewer & Editor for Power Users
+# pqr — Parquet Viewer & Editor
 
 A fast, **Vim-like** terminal UI for browsing, searching, editing, and wrangling large collections of Parquet files.
 
