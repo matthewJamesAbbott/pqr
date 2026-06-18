@@ -754,15 +754,26 @@ class ParquetReader(App[None]):
         Binding("e", "edit", "Edit"),
         Binding("a", "edit_append", "Append"),
         Binding("v", "view_cell", "View"),
+        Binding("y", "yank_cell", "Yank"),
         Binding("w", "save", "Save"),
         Binding("W", "export", "Export"),
-        Binding("o,ctrl+o", "open_file", "Open"),
-        Binding("s", "schema", "Schema"),
+        Binding("o", "open_file", "Open"),
+        Binding("O", "add_row", "AddRow"),
+        Binding("dd", "delete_row", "DelRow"),
+        Binding("ctrl+o", "open_file", "Open"),
+        Binding("s", "sort_column", "Sort"),
+        Binding("S", "schema", "Schema"),
         Binding("/", "search", "Search"),
         Binding("n", "search_next", "Next"),
         Binding("N", "search_prev", "Prev"),
         Binding("f", "filter", "Filter"),
+        Binding("H", "hide_column", "HideCol"),
         Binding("x", "stats", "Stats"),
+        Binding(":", "sql_query", "SQL"),
+        Binding("tab", "next_tab", "NextTab"),
+        Binding("shift+tab", "prev_tab", "PrevTab"),
+        Binding("gt", "next_tab", "NextTab"),
+        Binding("gT", "prev_tab", "PrevTab"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -825,9 +836,16 @@ class ParquetReader(App[None]):
         self._filter_bar: FilterBar | None = None
         self._footer: Footer | None = None
         self._search_bar: Label | None = None
+        self._deleted_rows: set[int] = set()
+        self._hidden_cols: set[str] = set()
+        self._sort_col: str | None = None
+        self._sort_asc: bool = True
+        self._clipboard: str = ""
+        self._tabs: list[dict] = []
+        self._active_tab: int = -1
 
     # -- mount ---------------------------------------------------------------
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         if self._path2 is not None:
             self.push_screen(
                 DiffScreen(str(self._path), str(self._path2)),
@@ -846,7 +864,7 @@ class ParquetReader(App[None]):
             )
             return
 
-        self._open_parquet(str(target))
+        await self._open_parquet(str(target))
 
     async def _on_file_chosen(self, path: str | None) -> None:
         if path:
@@ -859,7 +877,7 @@ class ParquetReader(App[None]):
             else:
                 await self._clear_widgets()
                 self._reset_state()
-                self._open_parquet(path)
+                await self._open_parquet(path)
 
     async def _clear_widgets(self) -> None:
         screen = self.screen
@@ -897,8 +915,15 @@ class ParquetReader(App[None]):
         self._filter_bar = None
         self._footer = None
         self._search_bar = None
+        self._deleted_rows = set()
+        self._hidden_cols = set()
+        self._sort_col = None
+        self._sort_asc = True
+        self._clipboard = ""
+        self._tabs = []
+        self._active_tab = -1
 
-    def _open_parquet(self, path: str) -> None:
+    async def _open_parquet(self, path: str) -> None:
         _add_to_history(path)
         self._path = Path(path)
 
@@ -913,7 +938,7 @@ class ParquetReader(App[None]):
             self._load_lazy_initial()
         else:
             self._df = pq.read_table(path).to_pandas()
-            self._populate_table(self._df)
+            await self._populate_table(self._df)
         self._update_status()
 
     def _load_lazy_initial(self) -> None:
@@ -1006,13 +1031,27 @@ class ParquetReader(App[None]):
             return pd.concat(chunks, ignore_index=True)
         return pd.DataFrame(columns=self._col_names)
 
-    def _populate_table(self, df: pd.DataFrame) -> None:
+    async def _populate_table(self, df: pd.DataFrame, clear: bool = True) -> None:
+        if clear:
+            if self._dt is not None:
+                self._dt.clear(columns=True)
+            else:
+                await self._clear_widgets()
         col_names = list(df.columns)
         self._col_names = col_names
         self._types = {c: str(t) for c, t in df.dtypes.to_dict().items()}
 
-        dt = PlainDataTable(show_cursor=True, zebra_stripes=True)
-        self._col_keys = dt.add_columns(*col_names)
+        if self._dt is None:
+            dt = PlainDataTable(show_cursor=True, zebra_stripes=True)
+            self._col_keys = dt.add_columns(*col_names)
+        else:
+            dt = self._dt
+            for ckey in list(self._col_keys):
+                try:
+                    dt.remove_column(ckey)
+                except Exception:
+                    pass
+            self._col_keys = dt.add_columns(*col_names)
 
         self._row_keys = list(
             dt.add_rows([
@@ -1021,13 +1060,15 @@ class ParquetReader(App[None]):
             ])
         )
 
+        self._raw.clear()
         for ri in range(len(df)):
             for ci, v in enumerate(df.iloc[ri].values):
                 self._raw[(ri, ci)] = self._full(v)
 
-        self._dt = dt
-        self.mount(dt)
-        self._mount_bars()
+        if self._dt is None:
+            self._dt = dt
+            self.mount(dt)
+            self._mount_bars()
 
     # -- helpers -------------------------------------------------------------
 
@@ -1224,7 +1265,7 @@ class ParquetReader(App[None]):
     # -- save ----------------------------------------------------------------
 
     def action_save(self) -> None:
-        if not self._edited:
+        if not self._edited and not self._deleted_rows:
             self.notify("[green]No changes to save.[/green]")
             return
 
@@ -1236,6 +1277,9 @@ class ParquetReader(App[None]):
         if df is None:
             self.notify("[red]Cannot save: no data loaded.[/red]")
             return
+
+        if self._deleted_rows:
+            df = df.drop(index=list(self._deleted_rows)).reset_index(drop=True)
 
         for (ri, ci), nv in self._edited.items():
             ci_actual = min(ci, len(self._col_names) - 1)
@@ -1251,6 +1295,7 @@ class ParquetReader(App[None]):
         self.notify(f"[green]Saved to {out.name}[/green]")
         self._edited.clear()
         self._origins.clear()
+        self._deleted_rows.clear()
         self._update_status()
 
     @staticmethod
@@ -1326,7 +1371,7 @@ class ParquetReader(App[None]):
             _add_to_history(str(self._path))
             await self._clear_widgets()
             self._reset_state()
-            self._open_parquet(path)
+            await self._open_parquet(path)
 
     # -- schema viewer -------------------------------------------------------
 
@@ -1459,7 +1504,7 @@ class ParquetReader(App[None]):
 
     # -- filter --------------------------------------------------------------
 
-    def action_filter(self) -> None:
+    async def action_filter(self) -> None:
         bar = self.query_one("#filter-bar", FilterBar)
         if bar.styles.visibility == "visible":
             bar.styles.visibility = "hidden"
@@ -1472,7 +1517,7 @@ class ParquetReader(App[None]):
             bar.styles.visibility = "visible"
             bar.focus()
 
-    def on_filter_bar_filter_changed(self, event: FilterBar.FilterChanged) -> None:
+    async def on_filter_bar_filter_changed(self, event: FilterBar.FilterChanged) -> None:
         bar = self.query_one("#filter-bar", FilterBar)
         query_str = bar.value.strip()
         if not query_str:
@@ -1480,7 +1525,7 @@ class ParquetReader(App[None]):
                 self._filter_active = False
                 self._filter_df = None
                 if self._df is not None:
-                    self._populate_table(self._df)
+                    await self._populate_table(self._df)
                 self._update_status()
             return
 
@@ -1525,7 +1570,7 @@ class ParquetReader(App[None]):
 
             self._filter_active = True
             self._filter_df = filtered
-            self._populate_table(filtered)
+            await self._populate_table(filtered)
             self._update_status()
         except Exception as e:
             self.notify(f"[red]Filter error: {e}[/red]")
@@ -1570,6 +1615,226 @@ class ParquetReader(App[None]):
             lines.append(f"[bold]False:[/bold] {int((~non_null).sum())}")
 
         self.notify(" | ".join(lines))
+
+    # -- yank (copy cell to clipboard) ---------------------------------------
+
+    def action_yank_cell(self) -> None:
+        info = self._get_cell()
+        if info is None:
+            return
+        ri, ci, display, rk, ck = info
+        self._clipboard = self._raw.get((ri, ci), display)
+        try:
+            from pyclipboard import Clipboard
+            Clipboard.copy(self._clipboard)
+        except Exception:
+            pass
+        self.notify(f"[green]Yanked:[/green] {self._clipboard[:80]}")
+
+    # -- hide/show column (H) ------------------------------------------------
+
+    def action_hide_column(self) -> None:
+        info = self._get_cell()
+        if info is None:
+            return
+        ri, ci, display, rk, ck = info
+        col_name = ck
+        if col_name in self._hidden_cols:
+            self._hidden_cols.discard(col_name)
+            try:
+                ckey = self._col_keys[ci] if ci < len(self._col_keys) else None
+                if ckey is not None:
+                    self._dt.show_column(ckey)
+            except Exception:
+                pass
+            self.notify(f"[green]Showd[/green] column {col_name}")
+        else:
+            self._hidden_cols.add(col_name)
+            try:
+                ckey = self._col_keys[ci] if ci < len(self._col_keys) else None
+                if ckey is not None:
+                    self._dt.hide_column(ckey)
+            except Exception:
+                pass
+            self.notify(f"[yellow]Hidden[/yellow] column {col_name}")
+
+    # -- sort column (s) -----------------------------------------------------
+
+    async def action_sort_column(self) -> None:
+        info = self._get_cell()
+        if info is None:
+            return
+        ri, ci, display, rk, ck = info
+        col_name = ck
+        if self._sort_col == col_name:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col_name
+            self._sort_asc = True
+        df = self._df
+        if df is None:
+            return
+        df = df.copy()
+        if self._is_container(df[col_name].iloc[0]):
+            df["_sort_key"] = df[col_name].apply(
+                lambda x: str(x) if (hasattr(x, 'size') and x.size > 0) else "",
+            )
+            df = df.sort_values("_sort_key", ascending=self._sort_asc)
+            df.drop(columns=["_sort_key"], inplace=True)
+        else:
+            df = df.sort_values(col_name, ascending=self._sort_asc)
+        df = df.reset_index(drop=True)
+        self._df = df
+        await self._populate_table(df)
+        self._update_status()
+        self.notify(f"[cyan]Sorted[/cyan] {col_name} {'↑' if self._sort_asc else '↓'}")
+
+    # -- delete row (dd) -----------------------------------------------------
+
+    def action_delete_row(self) -> None:
+        dt = self._dt
+        if dt is None or dt.cursor_row is None:
+            return
+        row = dt.cursor_row
+        self._deleted_rows.add(row)
+        try:
+            rkey = self._row_keys[row] if row < len(self._row_keys) else None
+            if rkey is not None:
+                self._dt.hide_row(rkey)
+        except Exception:
+            pass
+        self.notify(f"[red]Marked row {row+1}[/red] for deletion")
+
+    # -- add row (O) ---------------------------------------------------------
+
+    async def action_add_row(self) -> None:
+        if self._df is None:
+            return
+        new_row = pd.DataFrame({c: [pd.NA] for c in self._col_names})
+        self._df = pd.concat([self._df, new_row], ignore_index=True)
+        self._num_rows = len(self._df)
+        await self._populate_table(self._df)
+        self._update_status()
+        last = len(self._df) - 1
+        self._dt.cursor_coordinate = (last, 0)
+        self.notify(f"[green]Added row {last+1}[/green]")
+
+    # -- SQL query mode (:) --------------------------------------------------
+
+    class SqlPrompt(Container):
+        class SqlSubmitted(Message):
+            def __init__(self, value: str) -> None:
+                super().__init__()
+                self.value = value
+
+        CSS = """
+            height: 1;
+            width: 100%;
+            background: $accent;
+            #sql-prefix {
+                width: 3;
+                color: $surface;
+                background: $accent;
+            }
+            #sql-input {
+                width: 1fr;
+            }
+        """
+
+        def __init__(self) -> None:
+            super().__init__(
+                Static(":", id="sql-prefix"),
+                Input(id="sql-input", placeholder="DuckDB SQL query..."),
+                id="sql-prompt",
+            )
+
+        def on_mount(self) -> None:
+            self.query_one("#sql-input", Input).focus()
+
+        def on_key(self, event) -> None:
+            inp = self.query_one("#sql-input", Input)
+            if event.key == "enter":
+                event.prevent_default()
+                self.post_message(SqlPrompt.SqlSubmitted(inp.value))
+                self.remove()
+            elif event.key == "escape":
+                event.prevent_default()
+                self.remove()
+
+    def action_sql_query(self) -> None:
+        self.mount(SqlPrompt())
+
+    async def on_sql_prompt_sql_submitted(self, event: SqlPrompt.SqlSubmitted) -> None:
+        query = event.value.strip()
+        if not query:
+            return
+        try:
+            import duckdb as dd
+            df = self._filter_df if self._filter_active else self._df
+            if df is None:
+                self.notify("[yellow]No data for SQL query.[/yellow]")
+                return
+            rel = dd.table(df)
+            result = dd.sql(query).arrow().to_pandas()
+            self._filter_active = True
+            self._filter_df = result
+            old_cols = self._col_names
+            await self._populate_table(result)
+            self._col_names = old_cols
+            self._update_status()
+            self.notify(f"[green]SQL result:[/green] {len(result)} rows")
+        except ImportError:
+            self.notify("[yellow]Install duckdb: pip install duckdb[/yellow]")
+        except Exception as e:
+            self.notify(f"[red]SQL error:[/red] {e}")
+
+    # -- multi-file tabs (Tab/gt/gT) -----------------------------------------
+
+    def _save_tab_state(self) -> None:
+        if self._path is None:
+            return
+        for i, tab in enumerate(self._tabs):
+            if tab["path"] == str(self._path):
+                tab["active"] = True
+                self._active_tab = i
+                return
+        self._tabs.append({
+            "path": str(self._path),
+            "df": self._df.copy() if self._df is not None else None,
+            "active": True,
+        })
+        self._active_tab = len(self._tabs) - 1
+
+    async def _load_tab_state(self, index: int) -> None:
+        if 0 <= index < len(self._tabs):
+            tab = self._tabs[index]
+            for t in self._tabs:
+                t["active"] = False
+            tab["active"] = True
+            self._active_tab = index
+            path = tab["path"]
+            self._path = Path(path)
+            self._df = tab.get("df")
+            if self._df is not None:
+                self._num_rows = len(self._df)
+                self._parquet_file = pq.ParquetFile(path)
+                self._schema = self._parquet_file.schema_arrow
+                await self._populate_table(self._df, clear=False)
+                self._update_status()
+
+    async def action_next_tab(self) -> None:
+        if len(self._tabs) <= 1:
+            return
+        self._save_tab_state()
+        next_idx = (self._active_tab + 1) % len(self._tabs)
+        await self._load_tab_state(next_idx)
+
+    async def action_prev_tab(self) -> None:
+        if len(self._tabs) <= 1:
+            return
+        self._save_tab_state()
+        prev_idx = (self._active_tab - 1) % len(self._tabs)
+        await self._load_tab_state(prev_idx)
 
     # -- quit ----------------------------------------------------------------
 
