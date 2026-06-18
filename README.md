@@ -10,6 +10,11 @@ Built for people who actually live in their data — especially RAG pipelines, m
 - In-place cell editing with type safety
 - One-page-per-row book RAG workflows (DDC trees, summaries, metadata)
 
+![PQR 1][pqr1.png]
+
+![PQR 2][pqr2.png]
+
+![PQR 3][pqr3.png]
 
 ---
 
