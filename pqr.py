@@ -224,18 +224,19 @@ class SchemaScreen(Screen[None]):
         log = self.query_one("#schema-log", RichLog)
         meta = pq.read_metadata(self._path)
         log.write(f"[bold cyan]File:[/bold cyan] {self._path}\n")
-        log.write(f"[bold cyan]Columns:[/bold cyan] {self._schema.num_columns}\n")
+        log.write(f"[bold cyan]Columns:[/bold cyan] {len(self._schema)}\n")
         log.write(f"[bold cyan]Row groups:[/bold cyan] {meta.num_row_groups}\n")
         log.write(f"[bold cyan]Rows:[/bold cyan] {meta.num_rows}\n\n")
         log.write("[bold]Column Details:[/bold]\n")
-        for i in range(self._schema.num_columns):
+        for i in range(len(self._schema)):
             field = self._schema[i]
             col_meta = meta.row_group(0).column(i)
             log.write(f"  [cyan]{i+1}.[/cyan] [bold]{field.name}[/bold] : {field.type}")
             encodings = getattr(col_meta, "encodings", None)
             if encodings:
                 log.write(f"    encodings: {encodings}")
-            log.write(f"    null_count: {col_meta.null_count}")
+            stats = col_meta.statistics
+            log.write(f"    null_count: {stats.null_count if stats else 'N/A'}")
             log.write(f"    compressed_size: {col_meta.total_compressed_size} bytes\n")
 
 
@@ -641,7 +642,7 @@ class FilterBar(Input):
             self.value = value
 
     def _on_input_changed(self) -> None:
-        self.post_message(self.FilterBar.FilterChanged(self.value))
+        self.post_message(FilterBar.FilterChanged(self.value))
 
 
 # ---------------------------------------------------------------------------
@@ -1426,39 +1427,6 @@ class ParquetReader(App[None]):
             self.notify("[yellow]No matches found.[/yellow]")
             self._dt.focus()
 
-    def _on_search_result(self, pattern: str | None) -> None:
-        if pattern is None:
-            return
-        self._search_pattern = pattern
-        self._search_matches = []
-        self._search_cursor = -1
-
-        df = self._filter_df if self._filter_active else self._df
-        if df is None:
-            self.notify("[yellow]No data to search.[/yellow]")
-            return
-
-        pattern_lower = pattern.lower()
-        for ri in range(len(df)):
-            for ci, col_name in enumerate(self._col_names):
-                val = df.iloc[ri, ci]
-                if ParquetReader._is_container(val):
-                    if val.size > 0 and pattern_lower in str(val).lower():
-                        self._search_matches.append((ri, ci))
-                elif val is not None and not pd.isna(val):
-                    if pattern_lower in str(val).lower():
-                        self._search_matches.append((ri, ci))
-
-        if self._search_matches:
-            self._search_cursor = 0
-            r, c = self._search_matches[0]
-            self._dt.cursor_coordinate = (r, c)
-            self._update_status()
-            self._highlight_matches()
-            self._show_search_bar(pattern, len(self._search_matches))
-        else:
-            self.notify("[yellow]No matches found.[/yellow]")
-
     def _highlight_matches(self) -> None:
         if self._dt is None:
             return
@@ -1511,7 +1479,7 @@ class ParquetReader(App[None]):
             self._filter_active = False
             self._filter_df = None
             if self._df is not None:
-                self._populate_table(self._df)
+                await self._populate_table(self._df)
             self._update_status()
         else:
             bar.styles.visibility = "visible"
@@ -1618,18 +1586,98 @@ class ParquetReader(App[None]):
 
     # -- yank (copy cell to clipboard) ---------------------------------------
 
+    @staticmethod
+    def _copy_to_clipboard(text: str) -> bool:
+        """Copy text to clipboard, trying multiple methods. Returns True on success."""
+        import subprocess
+        import base64
+        import os
+
+        def _try_cmd(cmd: list[str]) -> bool:
+            try:
+                subprocess.run(cmd, input=text.encode(), capture_output=True, check=True)
+                return True
+            except Exception:
+                return False
+
+        def _osc52(device: str) -> bool:
+            try:
+                b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+                osc = f"\x1b]52;c;{b64}\x07"
+                with open(device, "w") as tty:
+                    tty.write(osc)
+                    tty.flush()
+                return True
+            except Exception:
+                return False
+
+        # 1. xclip (Linux X11)
+        if os.environ.get("DISPLAY") and _try_cmd(["xclip", "-selection", "clipboard"]):
+            return True
+
+        # 2. wl-copy (Linux Wayland)
+        if os.environ.get("WAYLAND_DISPLAY") and _try_cmd(["wl-copy"]):
+            return True
+
+        # 3. pbcopy (macOS)
+        if _try_cmd(["pbcopy"]):
+            return True
+
+        # 4. clip (Windows CMD)
+        if _try_cmd(["clip"]):
+            return True
+
+        # 5. OSC 52 to the correct terminal device (bypasses Textual's captured stdout)
+        tty_candidates = []
+
+        # If inside tmux, get the client's tty (outer terminal, not the pane)
+        if os.environ.get("TMUX"):
+            try:
+                result = subprocess.run(
+                    ["tmux", "display-message", "-p", "#{client_tty}"],
+                    capture_output=True, text=True
+                )
+                client_tty = result.stdout.strip()
+                if client_tty.startswith("/dev/"):
+                    tty_candidates.append(client_tty)
+            except Exception:
+                pass
+
+        # SSH_TTY (the SSH client's terminal)
+        if os.environ.get("SSH_TTY"):
+            tty_candidates.append(os.environ["SSH_TTY"])
+
+        # /dev/tty (controlling terminal)
+        tty_candidates.append("/dev/tty")
+
+        # Own stdin device from /proc
+        try:
+            own_fd = os.readlink("/proc/self/fd/0")
+            if own_fd.startswith("/dev/"):
+                tty_candidates.append(own_fd)
+        except Exception:
+            pass
+
+        # Deduplicate preserving order
+        seen = set()
+        for dev in tty_candidates:
+            if dev not in seen:
+                seen.add(dev)
+                if _osc52(dev):
+                    return True
+
+        return False
+
     def action_yank_cell(self) -> None:
         info = self._get_cell()
         if info is None:
             return
         ri, ci, display, rk, ck = info
         self._clipboard = self._raw.get((ri, ci), display)
-        try:
-            from pyclipboard import Clipboard
-            Clipboard.copy(self._clipboard)
-        except Exception:
-            pass
-        self.notify(f"[green]Yanked:[/green] {self._clipboard[:80]}")
+        if self._copy_to_clipboard(self._clipboard):
+            self.notify(f"[green]Yanked:[/green] {self._clipboard[:80]}")
+        else:
+            self.notify("[red]Yank failed:[/red] no clipboard backend available")
 
     # -- hide/show column (H) ------------------------------------------------
 
@@ -1675,6 +1723,8 @@ class ParquetReader(App[None]):
         if df is None:
             return
         df = df.copy()
+        if df.empty:
+            return
         if self._is_container(df[col_name].iloc[0]):
             df["_sort_key"] = df[col_name].apply(
                 lambda x: str(x) if (hasattr(x, 'size') and x.size > 0) else "",
@@ -1793,11 +1843,12 @@ class ParquetReader(App[None]):
     def _save_tab_state(self) -> None:
         if self._path is None:
             return
-        for i, tab in enumerate(self._tabs):
-            if tab["path"] == str(self._path):
-                tab["active"] = True
-                self._active_tab = i
-                return
+        if self._active_tab < len(self._tabs):
+            tab = self._tabs[self._active_tab]
+            tab["path"] = str(self._path)
+            tab["df"] = self._df.copy() if self._df is not None else None
+            tab["active"] = True
+            return
         self._tabs.append({
             "path": str(self._path),
             "df": self._df.copy() if self._df is not None else None,
