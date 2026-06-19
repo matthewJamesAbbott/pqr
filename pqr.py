@@ -8,11 +8,17 @@ pqr - Parquet Reader: a vim-like terminal viewer and editor for .parquet files.
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------
-import sys
+import argparse
+import asyncio
+import base64
 import json
+import os
 import statistics
+import subprocess
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -29,6 +35,387 @@ from textual.containers import Container, ScrollableContainer
 from textual.message import Message
 from rich.markup import escape
 from rich.text import Text
+
+# ---------------------------------------------------------------------------
+# Step / Pipeline — operation abstraction usable from CLI and TUI
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StepResult:
+    df: Optional[pd.DataFrame] = None
+    message: str = ""
+    yanked: str = ""
+    output: Optional[Any] = None
+
+
+@dataclass
+class Step:
+    name: str
+    args: dict = field(default_factory=dict)
+
+    @staticmethod
+    def parse_spec(spec: str) -> "Step":
+        """Parse 'name', 'name:key=value;key2=value2', or 'sql:SELECT * FROM df'."""
+        if ":" in spec:
+            name, rest = spec.split(":", 1)
+            name = name.strip()
+            rest = rest.strip()
+            # Steps that take a plain expression (no key= prefix): sql, filter, python, shell, search
+            expr_steps = {"sql", "filter", "python", "shell", "search"}
+            if name in expr_steps:
+                return Step(name=name, args={"expr": rest})
+            # Parse key=value pairs separated by ;
+            args = {}
+            for part in rest.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    args[k.strip()] = v.strip()
+                elif part:
+                    args["expr"] = part
+            return Step(name=name, args=args)
+        return Step(name=spec.strip())
+
+
+@dataclass
+class PipelineState:
+    df: Optional[pd.DataFrame] = None
+    schema: Optional[pa.Schema] = None
+    path: Optional[Path] = None
+    hidden_cols: set = field(default_factory=set)
+    sort_col: Optional[str] = None
+    sort_asc: bool = True
+    clipboard: str = ""
+    messages: list[str] = field(default_factory=list)
+    args: dict = field(default_factory=dict)
+
+
+def _is_container(v: Any) -> bool:
+    return isinstance(v, (list, pd.Series)) or hasattr(v, "shape")
+
+
+def _try_copy(text: str) -> bool:
+    """Copy text to system clipboard, trying all available backends."""
+    import base64
+    import os
+    import subprocess
+
+    def _try_cmd(cmd: list[str]) -> bool:
+        try:
+            subprocess.run(cmd, input=text.encode(), capture_output=True, check=True)
+            return True
+        except Exception:
+            return False
+
+    def _osc52(device: str) -> bool:
+        try:
+            b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            osc = f"\x1b]52;c;{b64}\x07"
+            with open(device, "w") as tty:
+                tty.write(osc)
+                tty.flush()
+            return True
+        except Exception:
+            return False
+
+    if os.environ.get("DISPLAY") and _try_cmd(["xclip", "-selection", "clipboard"]):
+        return True
+    if os.environ.get("WAYLAND_DISPLAY") and _try_cmd(["wl-copy"]):
+        return True
+    if _try_cmd(["pbcopy"]):
+        return True
+    if _try_cmd(["clip"]):
+        return True
+
+    tty_candidates = []
+    if os.environ.get("TMUX"):
+        try:
+            result = subprocess.run(
+                ["tmux", "display-message", "-p", "#{client_tty}"],
+                capture_output=True, text=True
+            )
+            client_tty = result.stdout.strip()
+            if client_tty.startswith("/dev/"):
+                tty_candidates.append(client_tty)
+        except Exception:
+            pass
+    if os.environ.get("SSH_TTY"):
+        tty_candidates.append(os.environ["SSH_TTY"])
+    tty_candidates.append("/dev/tty")
+    try:
+        own_fd = os.readlink("/proc/self/fd/0")
+        if own_fd.startswith("/dev/"):
+            tty_candidates.append(own_fd)
+    except Exception:
+        pass
+    seen = set()
+    for dev in tty_candidates:
+        if dev not in seen:
+            seen.add(dev)
+            if _osc52(dev):
+                return True
+    return False
+
+
+# -- Built-in step implementations ------------------------------------------
+
+def _step_schema(state: PipelineState) -> StepResult:
+    buf = f"File: {state.path}\n"
+    meta = pq.read_metadata(str(state.path))
+    buf += f"Columns: {len(state.schema)}\n"
+    buf += f"Row groups: {meta.num_row_groups}\n"
+    buf += f"Rows: {meta.num_rows}\n\n"
+    buf += "Column Details:\n"
+    for i in range(len(state.schema)):
+        fld = state.schema[i]
+        col_meta = meta.row_group(0).column(i)
+        buf += f"  {i+1}. {fld.name} : {fld.type}\n"
+        stats = col_meta.statistics
+        buf += f"    null_count: {stats.null_count if stats else 'N/A'}\n"
+        buf += f"    compressed_size: {col_meta.total_compressed_size} bytes\n"
+    return StepResult(df=state.df, message=buf)
+
+
+def _step_yank(state: PipelineState) -> StepResult:
+    col = state.args.get("column") or state.args.get("expr")
+    row = state.args.get("row")
+    if col is None:
+        return StepResult(df=state.df, message="Yank requires --column or --row")
+    df = state.df
+    if df is None or col not in df.columns:
+        return StepResult(df=state.df, message=f"Column '{col}' not found")
+    if row is not None:
+        row = int(row)
+        if row < 0:
+            row = len(df) + row
+        val = df[col].iloc[row]
+    else:
+        val = df[col].to_list()
+    text = str(val)
+    _try_copy(text)
+    state.clipboard = text
+    return StepResult(df=state.df, message=f"Yanked: {text[:120]}", yanked=text)
+
+
+def _step_search(state: PipelineState) -> StepResult:
+    pattern = state.args.get("expr", "").lower()
+    if not pattern or state.df is None:
+        return StepResult(df=state.df, message="No data to search")
+    df = state.df
+    matches = []
+    cols = [c for c in df.columns if c not in state.hidden_cols]
+    for ri in range(len(df)):
+        for ci, col in enumerate(cols):
+            val = df.iloc[ri, ci]
+            if _is_container(val):
+                if val.size > 0 and pattern in str(val).lower():
+                    matches.append((ri, col))
+            elif val is not None and not pd.isna(val):
+                if pattern in str(val).lower():
+                    matches.append((ri, col))
+    detail = f"\n".join(f"  row {r}, col {c}" for r, c in matches[:50])
+    if len(matches) > 50:
+        detail += f"\n  ... and {len(matches)-50} more"
+    return StepResult(df=state.df, message=f"Found {len(matches)} matches:\n{detail}")
+
+
+def _step_filter(state: PipelineState) -> StepResult:
+    expr = state.args.get("expr", "")
+    if not expr or state.df is None:
+        return StepResult(df=state.df, message="No filter expression")
+    df = state.df
+    filtered = df.query(expr)
+    return StepResult(df=filtered, message=f"Filtered: {len(filtered)} / {len(df)} rows")
+
+
+def _step_sort(state: PipelineState) -> StepResult:
+    col = state.args.get("column") or state.args.get("expr")
+    desc = state.args.get("desc", "false").lower() == "true"
+    if not col or state.df is None:
+        return StepResult(df=state.df, message="Sort requires --column")
+    df = state.df.copy()
+    if df.empty:
+        return StepResult(df=state.df, message="Empty DataFrame")
+    if _is_container(df[col].iloc[0]):
+        df["_sort_key"] = df[col].apply(
+            lambda x: str(x) if (hasattr(x, "size") and x.size > 0) else ""
+        )
+        df = df.sort_values("_sort_key", ascending=not desc)
+        df.drop(columns=["_sort_key"], inplace=True)
+    else:
+        df = df.sort_values(col, ascending=not desc)
+    df = df.reset_index(drop=True)
+    return StepResult(
+        df=df,
+        message=f"Sorted by {col} {'desc' if desc else 'asc'}"
+    )
+
+
+def _step_hide(state: PipelineState) -> StepResult:
+    col = state.args.get("column") or state.args.get("expr")
+    if not col or state.df is None:
+        return StepResult(df=state.df, message="Hide requires --column")
+    state.hidden_cols.add(col)
+    return StepResult(df=state.df, message=f"Hidden column: {col}")
+
+
+def _step_sql(state: PipelineState) -> StepResult:
+    expr = state.args.get("expr", "")
+    if not expr or state.df is None:
+        return StepResult(df=state.df, message="No SQL expression")
+    try:
+        import duckdb
+        con = duckdb.connect()
+        con.register("df", state.df)
+        result = con.execute(expr).fetchdf()
+        return StepResult(df=result, message=f"SQL result: {len(result)} rows")
+    except ImportError:
+        return StepResult(df=state.df, message="Install duckdb: pip install duckdb")
+    except Exception as e:
+        return StepResult(df=state.df, message=f"SQL error: {e}")
+
+
+def _step_stats(state: PipelineState) -> StepResult:
+    col = state.args.get("column")
+    if state.df is None:
+        return StepResult(df=state.df, message="No data")
+    df = state.df
+    cols = [col] if col else [c for c in df.columns if c not in state.hidden_cols]
+    buf = "Stats:\n"
+    for c in cols:
+        series = df[c].dropna()
+        if series.empty:
+            buf += f"  {c}: all null\n"
+            continue
+        numeric = pd.to_numeric(series, errors="coerce").dropna()
+        if len(numeric) > 0:
+            buf += (f"  {c}: count={len(numeric)}, "
+                    f"mean={numeric.mean():.2f}, "
+                    f"min={numeric.min():.2f}, max={numeric.max():.2f}\n")
+        else:
+            buf += f"  {c}: count={len(series)} (non-numeric)\n"
+    return StepResult(df=state.df, message=buf)
+
+
+def _step_delete_row(state: PipelineState) -> StepResult:
+    row = state.args.get("row", "0")
+    row = int(row)
+    if state.df is None or len(state.df) == 0:
+        return StepResult(df=state.df, message="No data")
+    if row < 0:
+        row = len(state.df) + row
+    if row >= len(state.df) or row < 0:
+        return StepResult(df=state.df, message=f"Row index {row} out of range")
+    df = state.df.drop(index=row).reset_index(drop=True)
+    return StepResult(df=df, message=f"Deleted row {row}")
+
+
+def _step_export(state: PipelineState) -> StepResult:
+    fmt = state.args.get("format", "csv")
+    out = state.args.get("output", "-")
+    if state.df is None:
+        return StepResult(df=state.df, message="No data to export")
+    if fmt == "json":
+        buf = state.df.to_json(orient="records", indent=2)
+    elif fmt == "parquet":
+        if out == "-":
+            return StepResult(df=state.df, message="Parquet export requires a file path")
+        state.df.to_parquet(out, index=False)
+        return StepResult(df=state.df, message=f"Exported to {out}")
+    else:
+        buf = state.df.to_csv(index=False)
+    return StepResult(df=state.df, message=buf, output=buf)
+
+
+def _step_python(state: PipelineState) -> StepResult:
+    expr = state.args.get("expr", "")
+    if not expr or state.df is None:
+        return StepResult(df=state.df, message="No Python expression")
+    local_ns = {"df": state.df, "pd": pd}
+    try:
+        result = eval(expr, {"__builtins__": __builtins__}, local_ns)
+        if isinstance(result, pd.DataFrame):
+            return StepResult(df=result, message=f"Python result: {len(result)} rows")
+        return StepResult(df=state.df, message=f"Python: {result}")
+    except Exception as e:
+        return StepResult(df=state.df, message=f"Python error: {e}")
+
+
+def _step_shell(state: PipelineState) -> StepResult:
+    cmd = state.args.get("expr", "")
+    if not cmd or state.df is None:
+        return StepResult(df=state.df, message="No shell command")
+    try:
+        csv_data = state.df.to_csv(index=False)
+        proc = subprocess.run(
+            cmd, shell=True, input=csv_data,
+            capture_output=True, check=True, text=True
+        )
+        return StepResult(df=state.df, message=proc.stdout)
+    except subprocess.CalledProcessError as e:
+        return StepResult(df=state.df, message=f"Shell error: {e.stderr}")
+    except Exception as e:
+        return StepResult(df=state.df, message=f"Shell error: {e}")
+
+
+_STEP_MAP = {
+    "schema": _step_schema,
+    "yank": _step_yank,
+    "search": _step_search,
+    "filter": _step_filter,
+    "sort": _step_sort,
+    "hide": _step_hide,
+    "sql": _step_sql,
+    "stats": _step_stats,
+    "delete-row": _step_delete_row,
+    "delete_row": _step_delete_row,
+    "delrow": _step_delete_row,
+    "export": _step_export,
+    "python": _step_python,
+    "shell": _step_shell,
+}
+
+
+class Pipeline:
+    def __init__(self) -> None:
+        self.steps: list[Step] = []
+
+    def add(self, step: Step) -> None:
+        self.steps.append(step)
+
+    def add_spec(self, spec: str) -> None:
+        self.add(Step.parse_spec(spec))
+
+    def run(self, state: PipelineState) -> list[StepResult]:
+        results = []
+        for step in self.steps:
+            handler = _STEP_MAP.get(step.name)
+            if handler is None:
+                results.append(StepResult(
+                    df=state.df,
+                    message=f"[red]Unknown step: {step.name}[/red]"
+                ))
+                continue
+            state.args = dict(step.args)
+            result = handler(state)
+            if result.df is not None:
+                state.df = result.df
+            if result.message:
+                state.messages.append(result.message)
+            if result.yanked:
+                state.clipboard = result.yanked
+            results.append(result)
+        return results
+
+
+def _build_state(path: str, schema: Optional[pa.Schema] = None) -> PipelineState:
+    df = pq.read_table(path).to_pandas()
+    pq_file = pq.ParquetFile(path)
+    return PipelineState(
+        df=df,
+        schema=schema or pq_file.schema_arrow,
+        path=Path(path),
+    )
 
 # ---------------------------------------------------------------------------
 # Recent-file history helper
@@ -844,6 +1231,8 @@ class ParquetReader(App[None]):
         self._clipboard: str = ""
         self._tabs: list[dict] = []
         self._active_tab: int = -1
+        self._startup_df: pd.DataFrame | None = None
+        self._startup_schema: pa.Schema | None = None
 
     # -- mount ---------------------------------------------------------------
     async def on_mount(self) -> None:
@@ -855,6 +1244,18 @@ class ParquetReader(App[None]):
 
         if self._path is None:
             self.push_screen(RecentFilesScreen(), callback=self._on_file_chosen)
+            return
+
+        # If startup state was provided (from pipeline), use it
+        if self._startup_df is not None:
+            self._df = self._startup_df
+            self._schema = self._startup_schema
+            self._num_rows = len(self._df)
+            self._parquet_file = pq.ParquetFile(str(self._path))
+            await self._populate_table(self._df)
+            self._update_status()
+            self._startup_df = None
+            self._startup_schema = None
             return
 
         target = self._path
@@ -1373,6 +1774,59 @@ class ParquetReader(App[None]):
             await self._clear_widgets()
             self._reset_state()
             await self._open_parquet(path)
+
+    # -- step execution (unifies CLI and TUI) --------------------------------
+
+    def _build_state(self) -> PipelineState:
+        return PipelineState(
+            df=self._filter_df if self._filter_active else self._df,
+            schema=self._schema,
+            path=self._path,
+            hidden_cols=self._hidden_cols,
+            sort_col=self._sort_col,
+            sort_asc=self._sort_asc,
+            clipboard=self._clipboard,
+        )
+
+    async def _run_step(self, step: Step) -> StepResult:
+        handler = _STEP_MAP.get(step.name)
+        if handler is None:
+            self.notify(f"[red]Unknown step: {step.name}[/red]")
+            return StepResult(message=f"Unknown step: {step.name}")
+
+        state = self._build_state()
+        state.args = dict(step.args)
+        result = handler(state)
+
+        if result.df is not None and step.name not in ("schema", "stats", "search", "shell", "yank"):
+            self._df = result.df
+            self._filter_df = result.df
+            await self._populate_table(result.df)
+            self._update_status()
+
+        if result.message:
+            self.notify(f"[green]{step.name}:[/green] {result.message[:150]}")
+        if result.yanked:
+            self._clipboard = result.yanked
+
+        if step.name == "hide" and state.args.get("column"):
+            col = state.args["column"]
+            if col in self._hidden_cols:
+                self._hidden_cols.discard(col)
+                try:
+                    for ci, ck in enumerate(self._col_keys):
+                        if self._col_names[ci] == col:
+                            self._dt.show_column(ck)
+                            break
+                except Exception:
+                    pass
+
+        return result
+
+    async def _run_steps(self, specs: list[str]) -> None:
+        for spec in specs:
+            step = Step.parse_spec(spec)
+            await self._run_step(step)
 
     # -- schema viewer -------------------------------------------------------
 
@@ -1899,21 +2353,240 @@ class ParquetReader(App[None]):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pqr",
+        description="Parquet viewer & editor — vim-like TUI for .parquet files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  pqr data.parquet                          # Open in TUI
+  pqr data.parquet --schema                 # Print schema
+  pqr data.parquet --step "filter:price > 10" --schema  # Filter then schema
+  pqr data.parquet --step "sql:SELECT * FROM df LIMIT 5"  # SQL query
+  pqr data.parquet --step "sort:column=price" --export  # Sort then export
+  pqr data.parquet --step "yank:column=name;row=0"       # Yank cell to clipboard
+
+Built-in steps (use --step):
+  schema          Print schema and column metadata
+  yank            Copy cell/column to clipboard (needs column=, optional row=)
+  search          Search text (expr=keyword)
+  filter          Filter rows (expr=pandas query string)
+  sort            Sort by column (column=name, desc=true/false)
+  hide            Hide column (column=name)
+  sql             Run SQL query (needs duckdb) (expr=SELECT ...)
+  stats           Column statistics (optional column=name)
+  delete-row      Delete row (row=index)
+  export          Export to CSV/JSON/parquet (format=csv, output=file)
+
+Custom steps:
+  python:EXPR     Evaluate Python expression (EXPR has df, pd available)
+  shell:CMD       Run shell command (data piped via stdin as CSV)
+
+Custom shortcuts:
+  Store in ~/.config/pqr/shortcuts.toml:
+    [shortcuts.summary]
+    steps = ["schema", "stats"]
+    [shortcuts.cleansed]
+    steps = ["filter:quality > 3", "hide:temp_col"]
+  Then: pqr data.parquet --shortcut summary
+""",
+    )
+    parser.add_argument(
+        "file", nargs="?", help="Parquet file to open"
+    )
+    parser.add_argument(
+        "file2", nargs="?", default=None, help="Second file for diff"
+    )
+    parser.add_argument(
+        "--step", "-s", action="append", default=[],
+        help="Step to run (repeatable). Format: name or name:key=value or name:expression"
+    )
+    parser.add_argument(
+        "--steps", default=None,
+        help="Comma-separated list of steps (alternative to --step)"
+    )
+    parser.add_argument(
+        "--batch", action="store_true",
+        help="Run steps without TUI (default when --step is given)"
+    )
+    parser.add_argument(
+        "--tui", action="store_true",
+        help="Open TUI after running steps"
+    )
+    parser.add_argument(
+        "--sql", default=None,
+        help="Shorthand for --step sql:EXPR"
+    )
+    parser.add_argument(
+        "--filter", default=None,
+        help="Shorthand for --step filter:EXPR"
+    )
+    parser.add_argument(
+        "--sort", default=None,
+        help="Shorthand for --step sort:column=NAME"
+    )
+    parser.add_argument(
+        "--column", default=None,
+        help="Column name for yank/sort/hide/stats (used with --step)"
+    )
+    parser.add_argument(
+        "--row", default=None,
+        help="Row index for yank/delete-row"
+    )
+    parser.add_argument(
+        "--shortcut", default=None,
+        help="Use a named shortcut from ~/.config/pqr/shortcuts.toml"
+    )
+    parser.add_argument(
+        "--export", action="store_true", default=None,
+        help="Shorthand for --step export (appended automatically)"
+    )
+    parser.add_argument(
+        "--schema", action="store_true", default=None,
+        help="Shorthand for --step schema (appended automatically)"
+    )
+    parser.add_argument(
+        "--yank", default=None,
+        help="Shorthand for --step yank:column=NAME"
+    )
+    parser.add_argument(
+        "--output", default="-",
+        help="Output file for export (default: stdout)"
+    )
+    parser.add_argument(
+        "--format", choices=["csv", "json", "parquet"], default="csv",
+        help="Export format (default: csv)"
+    )
+    return parser
+
+
+def _load_shortcuts() -> dict:
+    """Load custom shortcuts from ~/.config/pqr/shortcuts.toml."""
+    import os
+    import re
+    shortcut_path = Path.home() / ".config" / "pqr" / "shortcuts.toml"
+    if not shortcut_path.exists():
+        return {}
+    shortcuts = {}
+    current = None
+    for line in shortcut_path.read_text().splitlines():
+        line = line.strip()
+        m = re.match(r'^\[(\w+)\.(.+)\]$', line)
+        if m:
+            if m.group(1) == "shortcuts":
+                current = m.group(2)
+                shortcuts[current] = {}
+            continue
+        if current and line.startswith("steps = ["):
+            items = re.findall(r'"([^"]*)"', line)
+            shortcuts[current]["steps"] = items
+        if current and line.startswith("description = "):
+            desc = line.split("=", 1)[1].strip().strip('"')
+            shortcuts[current]["description"] = desc
+    return shortcuts
+
+
 def main(argv):
-    if len(argv) < 2 or argv[1] in ("-h", "--help"):
-        print("pqr — Parquet viewer & editor\n\nUsage: pqr [file.parquet [file2.parquet] | directory]\n\nNavigate:  j/k  h/l  g/G  arrow keys  PgUp/PgDn\nEdit:      i/e (edit)  a (append)  v (view full)\nActions:   w (save)  W (export)  o (open file)  s (schema)")
-        print("\nSearch:    / (search)  n/N (next/prev match)\nFilter:    f (toggle filter bar)\nInfo:      x (column stats)\nDiff:      pqr file1.parquet file2.parquet\nQuit:      q")
+    parser = _build_parser()
+    args = parser.parse_args(argv[1:])
+
+    if not args.file:
+        parser.print_help()
         sys.exit(0)
 
-    path = argv[1]
-
+    path = args.file
     if not Path(path).exists():
         print(f"Error: not found — {path}", file=sys.stderr)
         sys.exit(1)
 
-    path2 = argv[2] if len(argv) > 2 else None
+    # Build step list from CLI args
+    pipeline = Pipeline()
 
-    ParquetReader(path, path2).run()
+    # --steps (comma-separated)
+    if args.steps:
+        for spec in args.steps.split(","):
+            spec = spec.strip()
+            if spec:
+                pipeline.add_spec(spec)
+
+    # --step (repeated)
+    for spec in args.step:
+        pipeline.add_spec(spec)
+
+    # --sql shorthand
+    if args.sql:
+        pipeline.add_spec(f"sql:{args.sql}")
+
+    # --filter shorthand
+    if args.filter:
+        pipeline.add_spec(f"filter:{args.filter}")
+
+    # --sort shorthand
+    if args.sort:
+        pipeline.add_spec(f"sort:column={args.sort}")
+
+    # --yank shorthand
+    if args.yank:
+        row_arg = f";row={args.row}" if args.row else ""
+        pipeline.add_spec(f"yank:column={args.yank}{row_arg}")
+
+    # --schema shorthand
+    if args.schema:
+        pipeline.add_spec("schema")
+
+    # --export shorthand (always last)
+    if args.export:
+        pipeline.add_spec(f"export:format={args.format};output={args.output}")
+
+    # --shortcut
+    if args.shortcut:
+        shortcuts = _load_shortcuts()
+        if args.shortcut not in shortcuts:
+            print(f"Error: shortcut '{args.shortcut}' not found", file=sys.stderr)
+            print(f"Available shortcuts: {', '.join(shortcuts.keys()) if shortcuts else 'none'}", file=sys.stderr)
+            sys.exit(1)
+        sc = shortcuts[args.shortcut]
+        for spec in sc.get("steps", []):
+            pipeline.add_spec(spec)
+
+    # Decide mode: batch vs TUI
+    batch_mode = args.batch or (bool(pipeline.steps) and not args.tui)
+
+    if batch_mode and pipeline.steps:
+        # Batch mode: run steps without TUI
+        state = _build_state(path)
+        results = pipeline.run(state)
+
+        # Print results
+        for result in results:
+            if result.message:
+                print(result.message)
+
+        # If export was the last step, print the output
+        last = results[-1] if results else None
+        if last and last.output is not None:
+            out_path = pipeline.steps[-1].args.get("output", "-") if pipeline.steps else "-"
+            if out_path == "-":
+                print(last.output)
+            else:
+                Path(out_path).write_text(last.output)
+
+        # If last result has df and no export, print as CSV
+        if last and last.df is not None and not args.export and last.output is None:
+            print(last.df.to_csv(index=False))
+
+    else:
+        # TUI mode: run steps first, then open TUI with result
+        if pipeline.steps:
+            state = _build_state(path)
+            results = pipeline.run(state)
+            app = ParquetReader(str(state.path), args.file2)
+            app._startup_df = state.df
+            app._startup_schema = state.schema
+            app.run()
+        else:
+            ParquetReader(path, args.file2).run()
 
 
 if __name__ == "__main__":
