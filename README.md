@@ -1,6 +1,6 @@
 # pqr — Parquet Viewer & Editor
 
-A fast, **Vim-like** terminal UI for browsing, searching, editing, and wrangling large collections of Parquet files.
+A fast, keyboard-driven terminal application for inspecting, querying, and editing Apache Parquet files. Built on the Textual TUI framework.
 
 <still under development not all options are 100% stable yet>
 
@@ -14,95 +14,183 @@ A fast, **Vim-like** terminal UI for browsing, searching, editing, and wrangling
 
 ---
 
-## Features
+## Quick Start
 
-- **Terminal UI:** Modern, responsive TUI with zebra-striped tables and a dynamic status bar.
-- **Vim-like Navigation:** `j`/`k` for up/down, `h`/`l` for left/right, `g`/`G` for top/bottom, plus `PgUp`/`PgDn`.
-- **In-Place Editing:** Edit cells with `i` or `e`, append to values with `a`.
-- **Full Cell Viewer:** Press `v` to inspect truncated cell contents in a scrollable popup.
-- **Yank Cell:** Press `y` to copy cell value to clipboard.
-- **Add Row:** Press `O` to append a new empty row.
-- **Delete Row:** Press `dd` to mark a row for deletion; applied on save (`w`).
-- **Sort Column:** Press `s` on a column to sort ascending/descending (toggle on repeat).
-- **Hide/Show Column:** Press `H` while cursor is on a column to toggle visibility.
-- **Type-Aware Saving:** Automatically converts edited strings back to original Parquet types (`int`, `float`, `bool`, `datetime`, `string`).
-- **Safe Workflows:** Tracks edits, warns on unsaved changes, and exports to a new `<filename>_edited.parquet` file.
-- **Export:** Press `W` to export as CSV, Excel (`.xlsx`), or Parquet.
-- **Global Search:** Press `/` to search across all columns (vim-style bottom prompt); `n`/`N` to jump between matches.
-- **Column Filtering:** Press `f` to toggle a filter bar; type `column == value` to filter rows.
-- **SQL Query Mode:** Press `:` to run a DuckDB query against the loaded data (requires `pip install duckdb`).
-- **Column Statistics:** Press `x` to show descriptive stats (mean, std, min, max, quartiles, nulls, unique counts) for the current column.
-- **Live Stats Bar:** Status bar shows min, max, mean, and null count for numeric columns as you navigate.
-- **Schema Viewer:** Press `S` to inspect the Parquet schema (types, encodings, null counts, compressed sizes).
-- **Multi-File Tabs:** Open several files with `o`; switch between them with `Tab`/`Shift+Tab` or `gt`/`gT`.
-- **File Browser:** Press `o` or `Ctrl+o` to open a file picker and switch files without exiting.
-- **Recent Files:** Last 10 opened files persisted in `~/.pqr_history`; shown on startup when run with no arguments.
-- **Directory Browsing:** Run `pqr ./data_folder/` to browse all `.parquet` files in a directory with metadata (rows, columns, size).
-- **Diff Mode:** Run `pqr file_v1.parquet file_v2.parquet` to compare two files side-by-side.
-- **Lazy Loading:** Files over 5,000 rows use row-group-based virtual scrolling for efficient memory usage.
+```bash
+# Open a parquet file in the terminal UI
+pqr data.parquet
+
+# Print schema without the UI
+pqr data.parquet --schema
+
+# Filter, sort, and export as CSV
+pqr data.parquet --step "filter:price > 100" --step "sort:column=price" --export
+
+# Run a SQL query
+pqr data.parquet --sql "SELECT category, COUNT(*) FROM df GROUP BY category"
+```
 
 ---
 
 ## Installation
 
-Requires Python 3.9+ and the following dependencies:
+Requires Python 3.9+ and the following core dependencies:
 
 ```bash
 pip install pandas pyarrow textual
 ```
 
-For Excel export support:
+Optional dependencies:
 
 ```bash
+# Excel export support
 pip install openpyxl
-```
 
-For SQL query mode:
-
-```bash
+# SQL query mode (press : in the TUI or use --sql)
 pip install duckdb
+
+# Clipboard access (yank with y in the TUI)
+pip install pyperclip
+```
+
+Copy or symlink `pqr` to a directory in your `PATH`, or run it directly:
+
+```bash
+python3 pqr data.parquet
 ```
 
 ---
 
-## Usage
+## Usage Modes
 
-**Open a single file:**
+### Terminal UI (default)
 
 ```bash
-python pqr path/to/your/data.parquet
+pqr data.parquet
 ```
 
-**Browse a directory of parquet files:**
+Opens the full interactive TUI with navigation, editing, search, and all features described below.
 
 ```bash
-python pqr path/to/data_folder/
+# Browse a directory of .parquet files
+pqr data_folder/
+
+# Compare two files side by side
+pqr file_v1.parquet file_v2.parquet
+
+# Show recent files (last 10)
+pqr
 ```
 
-**Compare two files side-by-side:**
+### Batch Mode (no TUI)
+
+Add `--step` or `--steps` to run operations and print results to stdout without opening the UI:
 
 ```bash
-python pqr file_v1.parquet file_v2.parquet
+# Print schema
+pqr data.parquet --schema
+
+# Filter then print CSV
+pqr data.parquet --filter "page_num >= 100"
+
+# Chain multiple steps
+pqr data.parquet --step "filter:price > 10" --step "sort:column=price" --export
+
+# SQL query (requires duckdb)
+pqr data.parquet --sql "SELECT * FROM df LIMIT 10"
+
+# Run custom Python
+pqr data.parquet --step "python:len(df)"
+
+# Pipe to shell commands
+pqr data.parquet --step "shell:wc -l"
 ```
 
-**Start without arguments (shows recent files):**
+Run `pqr --help` for the full list of CLI options.
+
+---
+
+## Built-in Steps
+
+Steps are the basic units of operation. Each step takes the current data and produces a result. Steps can be chained: the output of one becomes the input of the next.
+
+| Step | Syntax | Description |
+|------|--------|-------------|
+| `schema` | `schema` | Print schema, column metadata, null counts |
+| `yank` | `yank:column=name;row=0` | Copy cell or entire column to clipboard |
+| `search` | `search:keyword` | Search text across all columns |
+| `filter` | `filter:col > 10` | Filter rows (pandas query syntax) |
+| `sort` | `sort:column=name;desc=true` | Sort by column |
+| `hide` | `hide:column=name` | Hide a column |
+| `sql` | `sql:SELECT * FROM df` | Run DuckDB SQL query |
+| `stats` | `stats;column=name` | Show column statistics |
+| `delete-row` | `delete-row;row=5` | Delete a row by index |
+| `export` | `export:format=json;output=out.json` | Export to CSV, JSON, or Parquet |
+| `python` | `python:df['col'].sum()` | Evaluate a Python expression |
+| `shell` | `shell:cut -d, -f1` | Pipe CSV data through a shell command |
+
+Steps use `:` to separate the step name from arguments, and `;` to separate multiple arguments:
 
 ```bash
-python pqr
+# yank row 5 of column "price"
+--step "yank:column=price;row=5"
+
+# export to JSON file
+--step "export:format=json;output=report.json"
+```
+
+### Shorthand flags
+
+Common steps have shorthand flags as shortcuts:
+
+```bash
+--schema              # --step schema
+--sql "SELECT ..."    # --step sql:SELECT ...
+--filter "col > 5"    # --step filter:col > 5
+--sort col_name       # --step sort:column=col_name
+--yank col_name       # --step yank:column=col_name
+--export              # --step export (appended last)
 ```
 
 ---
 
-## Keyboard Shortcuts
+## Custom Shortcuts
+
+Store reusable step sequences in `~/.config/pqr/shortcuts.toml`:
+
+```toml
+[shortcuts.summary]
+description = "Print schema and stats"
+steps = ["schema", "stats"]
+
+[shortcuts.highvalue]
+description = "High-value items sorted by price"
+steps = ["filter:price > 100", "sort:column=price;desc=true", "export:format=csv"]
+
+[shortcuts.textpages]
+description = "Pages that contain text"
+steps = ["python:len(df[df['text'].notna()])"]
+```
+
+Use them with `--shortcut`:
+
+```bash
+pqr data.parquet --shortcut summary
+pqr data.parquet --shortcut highvalue
+```
+
+---
+
+## Terminal UI
+
+When opened without `--step`, pqr launches the full interactive terminal UI.
 
 ### Navigation
 
 | Key | Action |
 |-----|--------|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `h` / `←` | Move left |
-| `l` / `→` | Move right |
+| `j` / `k` or `↑` / `↓` | Move cursor up/down |
+| `h` / `l` or `←` / `→` | Move cursor left/right |
 | `g` | Jump to top |
 | `G` | Jump to bottom |
 | `Ctrl+F` / `PgDn` | Page down |
@@ -114,38 +202,32 @@ python pqr
 |-----|--------|
 | `i` / `e` | Edit cell value |
 | `a` | Append to cell value |
-| `v` | View full cell contents |
-| `y` | Yank (copy) cell to clipboard |
-| `O` | Add new empty row |
-| `dd` | Mark row for deletion |
 | `Enter` / `Ctrl+J` | Confirm edit |
 | `Esc` | Cancel edit |
+| `v` | View full cell contents in a popup |
+| `y` | Copy cell value to clipboard |
+| `O` | Add a new empty row |
+| `dd` | Mark row for deletion (applied on save) |
 
-### Search & Filter
-
-| Key | Action |
-|-----|--------|
-| `/` | Search across all columns (vim-style prompt) |
-| `n` | Next search match |
-| `N` | Previous search match |
-| `f` | Toggle column filter bar |
-| `:` | SQL query mode (DuckDB) |
-
-### Data Manipulation
+### Data Operations
 
 | Key | Action |
 |-----|--------|
-| `s` | Sort current column (toggle ascending/descending) |
-| `H` | Hide/show current column |
+| `s` | Sort current column (toggles ascending/descending) |
+| `H` | Hide or show current column |
 | `x` | Show column statistics |
+| `/` | Search across all columns |
+| `n` / `N` | Next / previous search match |
+| `f` | Toggle filter bar (pandas query syntax) |
+| `:` | SQL query prompt (requires duckdb) |
 
 ### File & Export
 
 | Key | Action |
 |-----|--------|
-| `w` | Save to `<filename>_edited.parquet` |
-| `W` | Export (CSV / Excel / Parquet) |
-| `o` / `Ctrl+o` | Open file browser |
+| `o` / `Ctrl+O` | Open file browser |
+| `w` | Save edits to `<filename>_edited.parquet` |
+| `W` | Export as CSV, Excel, or Parquet |
 | `S` | View Parquet schema |
 
 ### Tabs
@@ -165,42 +247,20 @@ python pqr
 
 ## How It Works
 
-1. Loads the Parquet file via `pyarrow` into a `pandas.DataFrame` (or lazily via row groups for large files).
-2. Renders the data in a `textual` `DataTable` with cursor tracking and zebra-striped rows.
-3. Captures cell edits in an overlay screen, preserving original values for type-aware conversion.
-4. On save (`w`), applies type-aware conversions, drops marked-deletion rows, and writes a new Parquet file with an `_edited` suffix.
-5. Maintains an edit counter in the status bar with live column statistics for numeric types.
-6. Supports filtering, full-text search, column sorting, SQL queries, schema inspection, multi-file tabs, and side-by-side file comparison.
+1. Loads the Parquet file via `pyarrow` into a `pandas.DataFrame`. Files over 5,000 rows use lazy row-group loading for efficient memory usage.
+2. Renders data in a `textual` `DataTable` with cursor tracking and zebra-striped rows.
+3. Cell edits are captured in an overlay screen with type-aware conversion back to the original Parquet type.
+4. The **step pipeline** processes operations sequentially: each step receives the current data state and produces a new one.
+5. On save (`w`), marked rows are dropped and edited cells are type-converted before writing to a new `<filename>_edited.parquet` file.
+6. A status bar shows row counts, edit count, and live column statistics for numeric types.
 
 ---
 
 ## License
 
-MIT License
-
-Copyright (c) 2026 Matthew Abbott
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
----
+MIT License. Copyright (c) 2026 Matthew Abbott.
 
 ## Author
 
-**Matthew Abbott**
-Email: mattbachg@gmail.com
+**Matthew Abbott** — mattbachg@gmail.com
+
