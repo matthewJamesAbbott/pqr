@@ -64,7 +64,7 @@ open file → phase 1: sample 100 MB → ~3 000 rows + schema → TUI renders
 
 From that point, a single stream reader walks the decompressed output as you scroll. Forward movement fills a 3 000-row sliding window cache. Backward jumps reopen the stream from the beginning — slow for very large backward leaps, instant for anything already cached.
 
-Real-world numbers on the **281 GB worldcat** archive — 14 M rows, 29 columns, on spinning HDD:
+Real-world numbers on the **281 GB worldcat** archive — 14 M rows, 29 columns:
 
 | Action | Time | Notes |
 | :--- | :--- | :--- |
