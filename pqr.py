@@ -24,6 +24,14 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# ---------------------------------------------------------------------------
+# zstandard support (lazy import)
+# ---------------------------------------------------------------------------
+try:
+    import zstandard as zstd
+except ImportError:
+    zstd = None
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
@@ -88,6 +96,7 @@ class PipelineState:
     clipboard: str = ""
     messages: list[str] = field(default_factory=list)
     args: dict = field(default_factory=dict)
+    _zst_reader: Optional["LazyJsonlReader"] = None
 
 
 def _is_container(v: Any) -> bool:
@@ -161,6 +170,25 @@ def _try_copy(text: str) -> bool:
 
 def _step_schema(state: PipelineState) -> StepResult:
     buf = f"File: {state.path}\n"
+    if _is_zst_file(str(state.path)):
+        reader = state.args.get("_zst_reader")
+        if isinstance(reader, LazyJsonlReader):
+            buf += f"Columns: {len(reader.columns)}\n"
+            buf += f"Rows: {reader.num_rows}\n\n"
+            buf += "Column Details:\n"
+            for i, col in enumerate(reader.columns):
+                buf += f"  {i+1}. {col} : {reader.dtypes.get(col, 'object')}\n"
+            return StepResult(df=state.df, message=buf)
+        # Batch mode: the reader is not passed, build a new one
+        if hasattr(state, '_zst_reader') and state._zst_reader is not None:
+            buf += f"Columns: {len(state._zst_reader.columns)}\n"
+            buf += f"Rows: {state._zst_reader.num_rows}\n\n"
+            buf += "Column Details:\n"
+            for i, col in enumerate(state._zst_reader.columns):
+                buf += f"  {i+1}. {col} : {state._zst_reader.dtypes.get(col, 'object')}\n"
+        else:
+            buf += "Columns: ?\nRows: ?\n"
+        return StepResult(df=state.df, message=buf)
     meta = pq.read_metadata(str(state.path))
     buf += f"Columns: {len(state.schema)}\n"
     buf += f"Row groups: {meta.num_row_groups}\n"
@@ -408,7 +436,14 @@ class Pipeline:
         return results
 
 
+def _is_zst_file(path: str) -> bool:
+    """Check if path is a .zst (zstandard-compressed JSONL) file."""
+    return path.endswith(".zst") or path.endswith(".zst.")
+
+
 def _build_state(path: str, schema: Optional[pa.Schema] = None) -> PipelineState:
+    if _is_zst_file(path):
+        return _build_state_zst(path)
     df = pq.read_table(path).to_pandas()
     pq_file = pq.ParquetFile(path)
     return PipelineState(
@@ -416,6 +451,236 @@ def _build_state(path: str, schema: Optional[pa.Schema] = None) -> PipelineState
         schema=schema or pq_file.schema_arrow,
         path=Path(path),
     )
+
+
+# ---------------------------------------------------------------------------
+# LazyJsonlReader — lazy, chunked reader for .zst JSONL files
+# ---------------------------------------------------------------------------
+
+class LazyJsonlReader:
+    """Streaming reader for compressed JSONL, mimicking ParquetFile lazy loading.
+
+    Phase 1 (instant): sample first 100 MB compressed → ~5 K rows + schema.
+    Phase 2 (streaming): a single ``stream_reader`` walks the decompressed
+    output and fills a row cache.  Forward scrolls reuse the stream;
+    backward jumps reopen from the beginning.
+    """
+
+    SAMPLE_COMPRESSED_BYTES = 100 * 1024 * 1024
+    CHUNK_ROWS = 3000
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._file_size = os.path.getsize(path)
+        self._decompressor = zstd.ZstdDecompressor()
+        self._stream_reader: Any = None
+        self._stream_open: bool = False
+        self._num_rows: int = 0
+        self._all_columns: list[str] = []
+        self._dtypes: dict[str, str] = {}
+        self._rows_per_mb: float = 0.0
+        self._cache: list[dict] = []
+        self._cache_start: int = 0
+        self._cache_end: int = 0
+        self._eof: bool = False
+
+    @property
+    def num_rows(self) -> int:
+        return self._num_rows
+
+    @property
+    def columns(self) -> list[str]:
+        return self._all_columns
+
+    @property
+    def dtypes(self) -> dict[str, str]:
+        return self._dtypes
+
+    def _ensure_indexed(self) -> None:
+        if self._num_rows > 0:
+            return
+        self._sample_index()
+
+    def _sample_index(self) -> None:
+        with open(self._path, "rb") as f:
+            sr = self._decompressor.stream_reader(f)
+            raw = sr.read(self.SAMPLE_COMPRESSED_BYTES)
+            sr.close()
+        text = raw.decode("utf-8", errors="replace")
+        non_empty = [l for l in text.split("\n") if l.strip()]
+        sample_records = []
+        for line in non_empty[:5]:
+            try:
+                sample_records.append(json.loads(line))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+        self._rows_per_mb = len(non_empty) / (self.SAMPLE_COMPRESSED_BYTES / 1024 / 1024)
+        # For small files where entire content fits in sample, use actual count
+        sample_file_mb = self.SAMPLE_COMPRESSED_BYTES / 1024 / 1024
+        file_mb = self._file_size / 1024 / 1024
+        if file_mb <= sample_file_mb:
+            self._num_rows = len(non_empty)
+        else:
+            self._num_rows = int(self._rows_per_mb * file_mb)
+        self._all_columns = []
+        self._dtypes = {}
+        for rec in sample_records:
+            self._flatten_record(rec, self._all_columns, self._dtypes)
+        self._cache = []
+        for line in non_empty[:self.CHUNK_ROWS]:
+            try:
+                self._cache.append(self._flatten_to_dict(json.loads(line)))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+        self._cache_start = 0
+        self._cache_end = len(self._cache)
+
+    def _open_stream(self) -> None:
+        if self._stream_reader is not None:
+            try:
+                self._stream_reader.close()
+            except Exception:
+                pass
+        self._file = open(self._path, "rb")
+        self._stream_reader = self._decompressor.stream_reader(self._file)
+        self._stream_open = True
+
+    def _fill_cache_from(self, target_row: int) -> None:
+        if target_row < self._cache_end and target_row >= self._cache_start:
+            return
+        need_reopen = target_row < self._cache_start or not self._cache or not self._stream_open
+        if need_reopen:
+            self._open_stream()
+            self._cache = []
+            self._cache_start = 0
+            self._cache_end = 0
+            self._eof = False
+        produced = 0
+        buffer = b""
+        target = target_row - self._cache_start + self.CHUNK_ROWS
+        while produced < target and not self._eof:
+            chunk = self._stream_reader.read(1048576)
+            if not chunk:
+                self._eof = True
+                if buffer.strip():
+                    try:
+                        self._cache.append(self._flatten_to_dict(json.loads(buffer.strip().decode("utf-8"))))
+                        produced += 1
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if line.strip():
+                    produced += 1
+                    try:
+                        self._cache.append(self._flatten_to_dict(json.loads(line.decode("utf-8"))))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+        self._cache_end = self._cache_start + len(self._cache)
+
+    def get_row_range(self, start: int, end: int) -> pd.DataFrame:
+        self._ensure_indexed()
+        if start >= self._num_rows:
+            return pd.DataFrame(columns=self._all_columns)
+        end = min(end, self._num_rows)
+        n_rows = end - start
+        self._fill_cache_from(start)
+        idx_start = start - self._cache_start
+        idx_end = end - self._cache_start
+        records = self._cache[idx_start:idx_end]
+        return pd.DataFrame(records[:n_rows], columns=self._all_columns)
+
+    @staticmethod
+    def _flatten_record(rec: dict, columns: list[str], dtypes: dict[str, str]) -> None:
+        def _walk(obj, prefix: str) -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    _walk(v, f"{prefix}.{k}" if prefix else k)
+            elif isinstance(obj, list):
+                if prefix not in columns:
+                    columns.append(prefix)
+                if prefix not in dtypes:
+                    dtypes[prefix] = "list"
+            elif isinstance(obj, bool):
+                if prefix not in columns:
+                    columns.append(prefix)
+                if prefix not in dtypes:
+                    dtypes[prefix] = "bool"
+            elif isinstance(obj, int):
+                if prefix not in columns:
+                    columns.append(prefix)
+                if prefix not in dtypes:
+                    dtypes[prefix] = "int64"
+            elif isinstance(obj, float):
+                if prefix not in columns:
+                    columns.append(prefix)
+                if prefix not in dtypes:
+                    dtypes[prefix] = "float64"
+            elif obj is None:
+                if prefix not in columns:
+                    columns.append(prefix)
+                if prefix not in dtypes:
+                    dtypes[prefix] = "object"
+            elif isinstance(obj, str):
+                if prefix not in columns:
+                    columns.append(prefix)
+                if prefix not in dtypes:
+                    dtypes[prefix] = "object"
+        _walk(rec, "")
+
+    @staticmethod
+    def _flatten_to_dict(rec: dict) -> dict:
+        result = {}
+        def _walk(obj, prefix: str) -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    _walk(v, f"{prefix}.{k}" if prefix else k)
+            elif isinstance(obj, list):
+                result[prefix] = json.dumps(obj)
+            else:
+                result[prefix] = obj
+        _walk(rec, "")
+        return result
+
+    def close(self) -> None:
+        try:
+            if self._stream_reader:
+                self._stream_reader.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_file"):
+                self._file.close()
+        except Exception:
+            pass
+
+
+def _build_state_zst(path: str) -> PipelineState:
+    """Build PipelineState for a .zst JSONL file (lazy)."""
+    reader = LazyJsonlReader(path)
+    reader._ensure_indexed()
+    initial = reader.get_row_range(0, min(reader.CHUNK_ROWS, reader.num_rows))
+    state = PipelineState(
+        df=initial,
+        schema=None,
+        path=Path(path),
+        args={"_zst_reader": reader, "_zst": True},
+    )
+    state._zst_reader = reader
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Batch zst reader for CLI / pipeline steps
+# ---------------------------------------------------------------------------
+
+def _build_zst_reader(path: str) -> LazyJsonlReader:
+    """Create a LazyJsonlReader, ensuring the index is built."""
+    reader = LazyJsonlReader(path)
+    reader._ensure_indexed()
+    return reader
 
 # ---------------------------------------------------------------------------
 # Recent-file history helper
@@ -854,16 +1119,30 @@ class DirBrowserScreen(Screen[Optional[str]]):
         parquet_files = sorted(
             str(p) for p in Path(self._directory).glob("**/*.parquet")
         )
-        self._files = parquet_files
+        zst_files = sorted(
+            str(p) for p in Path(self._directory).glob("**/*.zst")
+        )
+        self._files = parquet_files + zst_files
 
         rows = []
-        for fpath in parquet_files:
+        for fpath in self._files:
             try:
-                meta = pq.read_metadata(fpath)
-                n_rows = meta.num_rows
-                n_cols = meta.num_columns
                 fsize = Path(fpath).stat().st_size
                 size_str = f"{fsize/1024:.1f}K" if fsize < 1024*1024 else f"{fsize/1024/1024:.1f}M"
+                if fpath.endswith(".parquet"):
+                    meta = pq.read_metadata(fpath)
+                    n_rows = meta.num_rows
+                    n_cols = meta.num_columns
+                else:
+                    if zstd is not None:
+                        reader = LazyJsonlReader(fpath)
+                        reader._ensure_indexed()
+                        n_rows = reader.num_rows
+                        n_cols = len(reader.columns)
+                        reader.close()
+                    else:
+                        n_rows = "?"
+                        n_cols = "?"
             except Exception:
                 n_rows, n_cols, size_str = "?", "?", "?"
             rows.append([Path(fpath).name, str(n_rows), str(n_cols), size_str])
@@ -871,7 +1150,7 @@ class DirBrowserScreen(Screen[Optional[str]]):
         if rows:
             dt.add_rows(rows)
         else:
-            dt.add_row("No .parquet files found", "0", "0", "0B")
+            dt.add_row("No .parquet or .zst files found", "0", "0", "0B")
 
     def action_down(self) -> None:
         if self._dt:
@@ -1205,12 +1484,14 @@ class ParquetReader(App[None]):
         self._dt: DataTable | None = None
         self._types: dict[str, str] = {}
         self._col_names: list[str] = []
+        self._all_columns: list[str] = []
         self._col_keys: list = []
         self._row_keys: list = []
         self._edited: dict[tuple[int, int], str] = {}
         self._origins: dict[tuple[int, int], str] = {}
         self._raw: dict[tuple[int, int], str] = {}
         self._parquet_file: pq.ParquetFile | None = None
+        self._zst_reader: LazyJsonlReader | None = None
         self._num_rows: int = 0
         self._lazy: bool = False
         self._visible_rows: int = 30
@@ -1251,7 +1532,10 @@ class ParquetReader(App[None]):
             self._df = self._startup_df
             self._schema = self._startup_schema
             self._num_rows = len(self._df)
-            self._parquet_file = pq.ParquetFile(str(self._path))
+            if _is_zst_file(str(self._path)):
+                self._zst_reader = self._startup_schema if isinstance(self._startup_schema, LazyJsonlReader) else None
+            else:
+                self._parquet_file = pq.ParquetFile(str(self._path))
             await self._populate_table(self._df)
             self._update_status()
             self._startup_df = None
@@ -1266,7 +1550,10 @@ class ParquetReader(App[None]):
             )
             return
 
-        await self._open_parquet(str(target))
+        if _is_zst_file(str(target)):
+            await self._open_zst(str(target))
+        else:
+            await self._open_parquet(str(target))
 
     async def _on_file_chosen(self, path: str | None) -> None:
         if path:
@@ -1279,7 +1566,10 @@ class ParquetReader(App[None]):
             else:
                 await self._clear_widgets()
                 self._reset_state()
-                await self._open_parquet(path)
+                if _is_zst_file(path):
+                    await self._open_zst(path)
+                else:
+                    await self._open_parquet(path)
 
     async def _clear_widgets(self) -> None:
         screen = self.screen
@@ -1299,12 +1589,16 @@ class ParquetReader(App[None]):
         self._dt = None
         self._types = {}
         self._col_names = []
+        self._all_columns = []
         self._col_keys = []
         self._row_keys = []
         self._edited = {}
         self._origins = {}
         self._raw = {}
         self._parquet_file = None
+        if self._zst_reader is not None:
+            self._zst_reader.close()
+        self._zst_reader = None
         self._num_rows = 0
         self._lazy = False
         self._filter_active = False
@@ -1343,6 +1637,43 @@ class ParquetReader(App[None]):
             await self._populate_table(self._df)
         self._update_status()
 
+    async def _open_zst(self, path: str) -> None:
+        _add_to_history(path)
+        self._path = Path(path)
+
+        if zstd is None:
+            self._notify_zstd_missing()
+            return
+
+        self._zst_reader = LazyJsonlReader(path)
+        self._zst_reader._ensure_indexed()
+        self._num_rows = self._zst_reader.num_rows
+        self._all_columns = self._zst_reader.columns
+
+        self._lazy = True
+
+        # Load initial chunk
+        self._df = self._zst_reader.get_row_range(0, min(self._visible_rows, self._num_rows))
+        self._col_names = self._all_columns
+        self._types = {c: self._zst_reader.dtypes.get(c, "object") for c in self._all_columns}
+
+        dt = PlainDataTable(show_cursor=True, zebra_stripes=True)
+        self._col_keys = dt.add_columns(*self._all_columns)
+        self._dt = dt
+        self.mount(dt)
+
+        self._mount_bars()
+        self._render_zst_visible_rows(0, min(self._visible_rows, self._num_rows))
+        self._update_status()
+
+    def _notify_zstd_missing(self) -> None:
+        try:
+            self.exit()
+        except Exception:
+            pass
+        print("Error: zstandard module not installed. Install with: pip install zstandard", file=sys.stderr)
+        sys.exit(1)
+
     def _load_lazy_initial(self) -> None:
         if self._parquet_file is None:
             return
@@ -1361,6 +1692,24 @@ class ParquetReader(App[None]):
         self._mount_bars()
         self._render_visible_rows(0, min(self._visible_rows, self._num_rows))
 
+    def _render_zst_visible_rows(self, start: int, end: int) -> None:
+        if self._zst_reader is None:
+            return
+        dt = self._dt
+        if dt is None:
+            return
+        df_chunk = self._zst_reader.get_row_range(start, end)
+        dt.clear(columns=True)
+        self._col_keys = dt.add_columns(*self._all_columns)
+        rows_data = [
+            [self._fmt(v) for v in df_chunk.iloc[idx - start].values]
+            for idx in range(start, min(end, self._num_rows))
+        ]
+        self._row_keys = list(dt.add_rows(rows_data))
+        for ri in range(start, min(end, self._num_rows)):
+            for ci, v in enumerate(df_chunk.iloc[ri - start].values):
+                self._raw[(ri, ci)] = self._full(v)
+
     def _mount_bars(self) -> None:
         filter_bar = FilterBar(id="filter-bar", placeholder="Filter (col == value)... press f to toggle")
         self.mount(filter_bar)
@@ -1375,6 +1724,9 @@ class ParquetReader(App[None]):
         self._footer = footer
 
     def _render_visible_rows(self, start: int, end: int) -> None:
+        if self._zst_reader is not None:
+            self._render_zst_visible_rows(start, end)
+            return
         if self._lazy and self._parquet_file is None:
             return
         dt = self._dt
@@ -1405,6 +1757,8 @@ class ParquetReader(App[None]):
             self._row_keys = list(dt.add_rows(rows_data))
 
     def _get_row_range(self, start: int, end: int) -> pd.DataFrame:
+        if self._zst_reader is not None:
+            return self._zst_reader.get_row_range(start, end)
         if self._parquet_file is None:
             return pd.DataFrame()
 
@@ -1596,7 +1950,10 @@ class ParquetReader(App[None]):
             viewport_row = self._dt.cursor_row or 0
         start = viewport_row
         end = start + self._visible_rows
-        self._render_visible_rows(start, end)
+        if self._zst_reader is not None:
+            self._render_zst_visible_rows(start, end)
+        else:
+            self._render_visible_rows(start, end)
 
     # -- editing -------------------------------------------------------------
 
@@ -1671,7 +2028,9 @@ class ParquetReader(App[None]):
             self.notify("[green]No changes to save.[/green]")
             return
 
-        if self._lazy:
+        if self._zst_reader is not None:
+            df = self._zst_reader.get_row_range(0, self._num_rows)
+        elif self._lazy:
             df = self._parquet_file.to_pandas() if self._parquet_file is not None else None
         else:
             df = self._df.copy() if self._df is not None else None
@@ -1692,9 +2051,14 @@ class ParquetReader(App[None]):
             except (ValueError, TypeError, IndexError):
                 pass
 
-        out = self._path.with_stem(self._path.stem + "_edited")
-        pq.write_table(pa.Table.from_pandas(df), str(out))
-        self.notify(f"[green]Saved to {out.name}[/green]")
+        if _is_zst_file(str(self._path)):
+            out = self._path.with_suffix(".edited.jsonl")
+            df.to_json(str(out), orient="records", lines=True, force_ascii=False)
+            self.notify(f"[green]Saved JSONL to {out.name}[/green]")
+        else:
+            out = self._path.with_stem(self._path.stem + "_edited")
+            pq.write_table(pa.Table.from_pandas(df), str(out))
+            self.notify(f"[green]Saved to {out.name}[/green]")
         self._edited.clear()
         self._origins.clear()
         self._deleted_rows.clear()
@@ -1723,7 +2087,9 @@ class ParquetReader(App[None]):
         if fmt is None:
             return
 
-        if self._lazy and self._parquet_file is not None:
+        if self._zst_reader is not None:
+            df = self._zst_reader.get_row_range(0, self._num_rows)
+        elif self._lazy and self._parquet_file is not None:
             df = self._parquet_file.to_pandas()
         else:
             df = self._df.copy() if self._df is not None else None
@@ -1773,14 +2139,17 @@ class ParquetReader(App[None]):
             _add_to_history(str(self._path))
             await self._clear_widgets()
             self._reset_state()
-            await self._open_parquet(path)
+            if _is_zst_file(path):
+                await self._open_zst(path)
+            else:
+                await self._open_parquet(path)
 
     # -- step execution (unifies CLI and TUI) --------------------------------
 
     def _build_state(self) -> PipelineState:
         return PipelineState(
             df=self._filter_df if self._filter_active else self._df,
-            schema=self._schema,
+            schema=self._schema if self._zst_reader is None else self._zst_reader,
             path=self._path,
             hidden_cols=self._hidden_cols,
             sort_col=self._sort_col,
@@ -1831,6 +2200,15 @@ class ParquetReader(App[None]):
     # -- schema viewer -------------------------------------------------------
 
     def action_schema(self) -> None:
+        if self._zst_reader is not None:
+            buf = f"File: {self._path}\n"
+            buf += f"Columns: {len(self._all_columns)}\n"
+            buf += f"Rows: {self._num_rows}\n\n"
+            buf += "Column Details:\n"
+            for i, col in enumerate(self._all_columns):
+                buf += f"  {i+1}. {col} : {self._types.get(col, 'object')}\n"
+            self.notify(buf[:200])
+            return
         if self._schema is None:
             self.notify("[yellow]No schema loaded.[/yellow]")
             return
@@ -2583,7 +2961,8 @@ def main(argv):
             results = pipeline.run(state)
             app = ParquetReader(str(state.path), args.file2)
             app._startup_df = state.df
-            app._startup_schema = state.schema
+            # Pass zst reader via schema for zst files, or pa.Schema for parquet
+            app._startup_schema = state.args.get("_zst_reader") if _is_zst_file(path) else state.schema
             app.run()
         else:
             ParquetReader(path, args.file2).run()
