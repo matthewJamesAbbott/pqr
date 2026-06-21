@@ -1,195 +1,182 @@
-# pqr — Parquet & JSONL Viewer
+# pqr — Parquet & JSONL Viewer & Editor
 
-**v0.x · under active development**
+A fast, keyboard-driven terminal application for inspecting, querying, and editing Apache Parquet and zstandard-compressed JSONL (`.zst`) files. Built on the [Textual](https://textual.textualize.io/) TUI framework. Think of it as "less" or "vim" but for columnar data.
 
-A vim-key terminal viewer and editor for Parquet files and compressed JSONL archives. Opens a 281 GB file in 0.12 seconds. Works on spinning disk.
+# <still under development>
 
-- Parquet
-- .jsonl.zst
-- Python 3.9+
-- Textual TUI
-- vim keybindings
-- SQL, filter, export
-- MIT License
+![PQR 1](pqr1.png)
+
+![PQR 2](pqr2.png)
+
+![PQR 3](pqr3.png)
+
+![PQR 4](pqr4.png)
+
+---
 
 ## Quick Start
 
 ```bash
-# open any parquet file
-$ pqr data.parquet
+# Open a parquet file in the terminal UI
+pqr data.parquet
 
-# open a 281 GB compressed JSONL archive — streams lazily, opens in ~0.1s
-$ pqr worldcat.jsonl.zst
+# Open a compressed JSONL file
+pqr data.jsonl.zst
 
-# schema without opening the TUI
-$ pqr data.parquet --schema
+# Print schema without the UI
+pqr data.parquet --schema
 
-# filter → sort → export as CSV, all in one command
-$ pqr data.parquet --step "filter:price > 100" --step "sort:column=price" --export
+# Filter, sort, and export as CSV
+pqr data.parquet --step "filter:price > 100" --step "sort:column=price" --export
 
-# SQL query (requires duckdb)
-$ pqr data.parquet --sql "SELECT category, COUNT(*) FROM df GROUP BY category"
+# Run a SQL query
+pqr data.parquet --sql "SELECT category, COUNT(*) FROM df GROUP BY category"
+
+# View recent files (last 10 opened)
+pqr
+
+# Compare two parquet files side by side
+pqr file_v1.parquet file_v2.parquet
+
+# Browse a directory of .parquet and .zst files
+pqr data_folder/
 ```
 
-## Value Propositions
+---
 
-**Multi-TB files, instant open**
-Two-phase lazy loading: decompress the first 100 MB to get your schema and first 3 000 rows, then stream forward on demand. The file stays on disk — only what you're looking at gets read.
+## Supported File Formats
 
-**Lives in the terminal**
-No browser, no Jupyter, no GUI. A full Textual TUI with zebra-striped rows, a live status bar, and vim-key navigation. Works over SSH, in tmux, on headless servers.
+| Format | Extension | Notes |
+|--------|-----------|-------|
+| Apache Parquet | `.parquet` | Full schema metadata, row groups, statistics |
+| Compressed JSONL | `.zst` | Zstandard-compressed JSON lines, lazy-streaming reader |
 
-**Composable step pipeline**
-Filter, sort, SQL, Python, shell — steps chain together, output piping to the next. Use them interactively in the TUI, or string them in a one-liner from the CLI.
+Both formats support all TUI features: navigation, editing, search, filtering, sorting, SQL, stats, and export.
 
-**Actually editable**
-Edit cells, append text, add rows, mark rows for deletion. Type-aware conversion back to the original Parquet or JSONL schema. Save produces `_edited.parquet` or `.edited.jsonl`.
-
-## The Problem It Solves
-
-Large analytical datasets — Open Library dumps, WorldCat metadata, Common Crawl, GDELT, Wikipedia SQL mirrors — are typically distributed as multi-gigabyte or multi-terabyte Zstandard-compressed JSONL files. The standard options are bad:
-
-- **Decompress first:** A 281 GB `.zst` might expand to 2–3 TB. You need the space, the time, and a reason to believe you'll use every row.
-- **Load into Pandas:** Crashes or swap-kills on anything that doesn't fit in RAM. Not an option for HDD-hosted archives.
-- **grep / jq:** Great for spot-checks, bad for browsing. No column view, no schema, no stats, no edit.
-- **pqr:** Stream what you need. See the schema instantly. Browse, filter, and query without touching disk beyond the rows currently on screen. The same philosophy applies to Parquet: files over 5 000 rows use lazy row-group loading, so a 50 M-row table opens just as fast as a 500-row one.
-
-## Lazy Streaming for `.jsonl.zst`
-
-Loading is split into two phases that run automatically:
-
-```
-open file → phase 1: sample 100 MB → ~3 000 rows + schema → TUI renders
-```
-
-From that point, a single stream reader walks the decompressed output as you scroll. Forward movement fills a 3 000-row sliding window cache. Backward jumps reopen the stream from the beginning — slow for very large backward leaps, instant for anything already cached.
-
-Real-world numbers on the **281 GB worldcat** archive — 14 M rows, 29 columns:
-
-| Action | Time | Notes |
-| :--- | :--- | :--- |
-| Initial open (first 3 000 rows) | ~0.12 s | Schema inferred, DataTable rendered |
-| Next page (rows already cached) | instant | Served from in-memory window |
-| Scroll beyond cache | ~0.3–0.5 s | Per page, decompresses the next chunk |
-| Schema display (`S`) | instant | Read from Phase 1 sample, no extra IO |
-| Export to CSV (`W`) | full decompression | Only operation that reads the whole file |
-
-> **Tip:** For repeated SQL queries on a large `.zst` file, export to Parquet first (`W` → parquet). Parquet's row-group structure lets pqr seek directly to the rows you need without scanning from the start.
-
-### Column schema from nested JSONL
-
-Nested JSON objects are flattened using dot notation during Phase 1. A record like `{"meta": {"isbn": "...", "year": 2003}}` becomes columns `meta.isbn` and `meta.year`. Arrays are serialised as JSON strings and kept in a single column.
+---
 
 ## Installation
 
-Requires Python 3.9+. No build step — just install deps and run the script.
-
-**Core (required)**
+Requires Python 3.9+ and the following core dependencies:
 
 ```bash
 pip install pandas pyarrow textual
 ```
 
-**.zst file support (required for zst)**
+Optional dependencies:
 
 ```bash
+# SQL query mode (press : in the TUI or use --sql)
+pip install duckdb
+
+# Excel export support
+pip install openpyxl
+
+# Compressed JSONL (.zst) file support
 pip install zstandard
 ```
 
-**SQL queries (optional)**
+No external clipboard dependency is required. `pqr` uses a robust multi-backend clipboard system (xclip, wl-copy, pbcopy, clip, OSC 52) with tmux and SSH awareness, requiring no extra packages.
+
+Copy or symlink `pqr` to a directory in your `PATH`, or run it directly:
 
 ```bash
-pip install duckdb
-```
-
-**Excel export (optional)**
-
-```bash
-pip install openpyxl
-```
-
-**Clipboard yank (optional)**
-
-```bash
-pip install pyperclip
-```
-
-```bash
-# copy to your PATH, or just run directly
-chmod +x pqr
-cp pqr ~/.local/bin/
-
-# or run without installing
 python3 pqr data.parquet
 ```
 
+---
+
 ## Usage Modes
 
-### Terminal UI
-
-The default. Pass a file, a directory, or nothing at all:
+### Terminal UI (default)
 
 ```bash
-pqr data.parquet          # open file
-pqr archive.jsonl.zst     # open compressed JSONL
-pqr data_folder/          # browse directory for .parquet and .zst files
-pqr v1.parquet v2.parquet # side-by-side diff
-pqr                       # pick from 10 recent files
+pqr data.parquet          # Open a single file
+pqr                       # Recent files picker
+pqr data_folder/          # Browse .parquet and .zst files in a directory
+pqr v1.parquet v2.parquet # Side-by-side diff view
 ```
 
-### Batch mode (no TUI)
+The TUI provides full vim-style navigation, cell editing, in-place search, column filtering, sorting, statistics, SQL queries, export, and clipboard integration.
 
-Add any `--step` flag and pqr skips the UI, runs the pipeline, and prints results to stdout. Good for scripting and shell pipelines:
+### Batch Mode (no TUI)
+
+Add `--step` or `--steps` to run operations and print results to stdout without opening the UI:
 
 ```bash
+# Print schema
 pqr data.parquet --schema
+
+# Filter then print CSV
 pqr data.parquet --filter "page_num >= 100"
+
+# Chain multiple steps
 pqr data.parquet --step "filter:price > 10" --step "sort:column=price" --export
+
+# SQL query (requires duckdb)
 pqr data.parquet --sql "SELECT * FROM df LIMIT 10"
+
+# Run custom Python
 pqr data.parquet --step "python:len(df)"
+
+# Pipe to shell commands
 pqr data.parquet --step "shell:wc -l"
-pqr archive.jsonl.zst --schema    # schema works on .zst too
+
+# Force TUI after batch steps
+pqr data.parquet --step "filter:price > 100" --tui
 ```
 
-Add `--tui` to any batch command to apply the steps and then open the TUI with the resulting data.
+Run `pqr --help` for the full list of CLI options.
 
-## Step Pipeline
+---
 
-Every operation in pqr is a **step**. Steps take the current data state and produce a new one. Chain them with `--step` flags, or run them interactively in the TUI. Steps use `:` to separate the name from arguments and `;` to separate multiple arguments.
+## Built-in Steps
 
-```
-parquet / zst → filter → sort → sql → python → export
-```
+Steps are the basic units of operation. Each step takes the current data and produces a result. Steps can be chained: the output of one becomes the input of the next.
 
 | Step | Syntax | Description |
-| :--- | :--- | :--- |
-| `schema` | `schema` | Print schema, column types, null counts. zst-aware. |
-| `filter` | `filter:col > 10` | Filter rows using pandas query syntax. |
-| `sort` | `sort:column=name;desc=true` | Sort by column, ascending or descending. |
-| `sql` | `sql:SELECT * FROM df LIMIT 5` | Run DuckDB SQL. `df` is the current dataframe. |
-| `stats` | `stats;column=price` | Mean, min, max, std, quartiles, null count. |
-| `search` | `search:keyword` | Full-text search across all columns, returns row/col matches. |
-| `hide` | `hide:column=name` | Hide a column from the view (toggle). |
-| `yank` | `yank:column=price;row=5` | Copy cell or entire column to clipboard. Tries xclip, wl-copy, pbcopy, OSC 52. |
-| `export` | `export:format=json;output=out.json` | Export to CSV, JSON, or Parquet. |
-| `delete-row` | `delete-row;row=5` | Delete a row by index. |
-| `python` | `python:df['col'].sum()` | Evaluate a Python expression. `df` and `pd` available. |
-| `shell` | `shell:cut -d, -f1` | Pipe CSV data through any shell command via stdin. |
+|------|--------|-------------|
+| `schema` | `schema` | Print schema, column metadata, null counts, compression info |
+| `yank` | `yank:column=name;row=0` | Copy cell or entire column to clipboard |
+| `search` | `search:keyword` | Search text across all columns |
+| `filter` | `filter:col > 10` | Filter rows (pandas query syntax) |
+| `sort` | `sort:column=name;desc=true` | Sort by column (asc/desc) |
+| `hide` | `hide:column=name` | Hide a column from view |
+| `sql` | `sql:SELECT * FROM df` | Run DuckDB SQL query |
+| `stats` | `stats;column=name` | Show column statistics (count, mean, min, max) |
+| `delete-row` | `delete-row;row=5` | Delete a row by index |
+| `export` | `export:format=json;output=out.json` | Export to CSV, JSON, or Parquet |
+| `python` | `python:df['col'].sum()` | Evaluate a Python expression (has `df`, `pd`) |
+| `shell` | `shell:cut -d, -f1` | Pipe CSV data through a shell command |
+
+Steps use `:` to separate the step name from arguments, and `;` to separate multiple arguments:
+
+```bash
+# yank row 5 of column "price"
+--step "yank:column=price;row=5"
+
+# export to JSON file
+--step "export:format=json;output=report.json"
+```
 
 ### Shorthand flags
 
+Common steps have shorthand CLI flags as shortcuts:
+
 ```bash
---schema            # --step schema
---sql "SELECT ..."  # --step sql:SELECT ...
---filter "col > 5"  # --step filter:col > 5
---sort col_name     # --step sort:column=col_name
---yank col_name     # --step yank:column=col_name
---export            # --step export (always appended last)
+--schema              # --step schema
+--sql "SELECT ..."    # --step sql:SELECT ...
+--filter "col > 5"    # --step filter:col > 5
+--sort col_name       # --step sort:column=col_name
+--yank col_name       # --step yank:column=col_name
+--export              # --step export (appended last)
 ```
 
-### Custom shortcuts
+---
 
-Save reusable step sequences to `~/.config/pqr/shortcuts.toml`:
+## Custom Shortcuts
+
+Store reusable step sequences in `~/.config/pqr/shortcuts.toml`:
 
 ```toml
 [shortcuts.summary]
@@ -199,95 +186,171 @@ steps = ["schema", "stats"]
 [shortcuts.highvalue]
 description = "High-value items sorted by price"
 steps = ["filter:price > 100", "sort:column=price;desc=true", "export:format=csv"]
+
+[shortcuts.textpages]
+description = "Pages that contain text"
+steps = ["python:len(df[df['text'].notna()])"]
 ```
+
+Use them with `--shortcut`:
 
 ```bash
 pqr data.parquet --shortcut summary
 pqr data.parquet --shortcut highvalue
 ```
 
-## TUI Keybindings
+---
+
+## Terminal UI
+
+When opened without `--step`, pqr launches the full interactive terminal UI.
 
 ### Navigation
 
 | Key | Action |
-| :--- | :--- |
-| `j` / `k` | Move cursor up / down |
-| `h` / `l` | Move cursor left / right |
-| `g` | Jump to top |
-| `G` | Jump to bottom |
-| `Ctrl+F` | Page down |
-| `Ctrl+B` | Page up |
-| `Tab` / `gt` | Next tab |
-| `Shift+Tab` / `gT` | Previous tab |
+|-----|--------|
+| `j` / `k` or `↑` / `↓` | Move cursor up/down |
+| `h` / `l` or `←` / `→` | Move cursor left/right |
+| `g` | Jump to top of file |
+| `G` | Jump to bottom of file |
+| `Ctrl+G` | Jump to a specific row number |
+| `Ctrl+F` / `PgDn` | Page down |
+| `Ctrl+B` / `PgUp` | Page up |
+
+For large files (5,000+ rows for Parquet, all `.zst` files), pqr uses **lazy loading**: only the visible rows are loaded into memory, streaming data on-demand as you scroll.
 
 ### Editing
 
 | Key | Action |
-| :--- | :--- |
-| `i` / `e` | Edit cell value |
-| `a` | Append to cell value |
-| `Enter` | Confirm edit |
-| `Esc` | Cancel edit |
-| `v` | View full cell in popup |
-| `y` | Copy cell to clipboard |
-| `O` | Add new empty row |
-| `dd` | Mark row for deletion |
+|-----|--------|
+| `i` / `e` | Edit cell value in a popup |
+| `a` | Append to cell value (cursor at end) |
+| `v` | View full cell contents in a scrollable popup |
+| `y` | Copy cell value to clipboard (yank) |
+| `O` | Add a new empty row at the end |
+| `dd` | Mark current row for deletion |
 
-### Data operations
+Edits are tracked in-memory. Type-aware conversion ensures values are cast back to the correct data type on save.
 
-| Key | Action |
-| :--- | :--- |
-| `s` | Sort column (toggles asc / desc) |
-| `H` | Hide / show current column |
-| `x` | Column statistics |
-| `f` | Toggle filter bar |
-| `/` | Search across all columns |
-| `n` / `N` | Next / previous match |
-| `:` | SQL query prompt (DuckDB) |
-| `S` | View schema |
-
-### File & Export
+### Saving
 
 | Key | Action |
-| :--- | :--- |
-| `o` / `Ctrl+O` | Open file browser |
-| `w` | Save edits to `_edited` file |
-| `W` | Export as CSV, Excel, or Parquet |
-| `q` | Quit (warns on unsaved edits) |
+|-----|--------|
+| `w` | Save edits to `<filename>_edited.parquet` (or `.edited.jsonl` for `.zst` files) |
 
-> **Save behaviour:** For Parquet files, `w` writes `<filename>_edited.parquet`. For `.zst` files, it writes an uncompressed `.edited.jsonl` — the full file is decompressed for the save pass.
+Saves apply all cell edits, type conversions, and row deletions to a new file alongside the original.
 
-## How It Works
+### Data Operations
 
-### Parquet files
+| Key | Action |
+|-----|--------|
+| `s` | Sort current column (toggles ascending/descending) |
+| `H` | Hide or show current column (toggle) |
+| `x` | Show column statistics in status bar |
+| `/` | Search across all columns (vim-style prompt) |
+| `n` / `N` | Next / previous search match |
+| `f` | Toggle filter bar (pandas query syntax, e.g. `col == value`) |
+| `:` | SQL query prompt (requires duckdb) |
 
-Loaded via `pyarrow` into a `pandas.DataFrame`. Files over 5 000 rows use lazy row-group loading — only the groups needed for the current viewport are read. The `ParquetFile` object stays open so seeking between row groups is cheap.
+### File Operations
 
-### `.jsonl.zst` files — LazyJsonlReader
+| Key | Action |
+|-----|--------|
+| `o` / `Ctrl+O` | Open file browser (directory tree) |
+| `W` | Export as CSV, Excel (`.xlsx`), or Parquet |
+| `S` | View full schema details (types, null counts, encodings, compressed sizes) |
 
-A custom streaming class that mirrors the Parquet lazy-loading pattern for compressed JSONL:
+### Tabs
 
-1. **Phase 1 (instant):** Opens the file, decompresses the first 100 MB, and uses the output to infer a flattened column schema (nested JSON keys joined with `.`), estimate total row count from decompressed bytes per MB, and populate the first cache window of 3 000 rows.
-2. **Phase 2 (streaming):** A single `stream_reader` walks the decompressed output as you scroll forward, filling a sliding 3 000-row cache. Forward scrolling extends the stream; backward jumps reopen it from the beginning.
+| Key | Action |
+|-----|--------|
+| `Tab` / `gt` | Next tab |
+| `Shift+Tab` / `gT` | Previous tab |
 
-### Step pipeline execution
+Open multiple files in tabs by using the file browser (`o`). Switch between tabs to compare datasets without quitting.
 
-Steps are parsed from CLI specs or TUI prompts into `Step` objects, then dispatched through `_STEP_MAP` to handler functions. Each handler receives a `PipelineState` (current dataframe + metadata) and returns a `StepResult`. The TUI and batch-mode CLI share the same handlers — the only difference is whether results go to the DataTable widget or stdout.
+### Other
 
-### Cell editing
-
-Edits are held in a dictionary keyed by `(row, col)` index until save. On `w`, the full dataframe is reconstructed (reading all row groups or decompressing the full `.zst` stream), deleted rows are dropped, and edited cells are type-converted back to the original column dtype before writing.
-
-## Supported File Types
-
-| Format | Extension | Read | Write | SQL / filter | Lazy load |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| Apache Parquet | `.parquet` | Yes | Yes (`_edited.parquet`) | Yes | Yes (row-group) |
-| Compressed JSONL | `.jsonl.zst` | Yes | Yes (`.edited.jsonl`) | Yes (full decomp) | Yes (streaming) |
+| Key | Action |
+|-----|--------|
+| `q` | Quit (warns if unsaved edits exist) |
 
 ---
 
-**Matthew Abbott** · mattbachg@gmail.com
+## Side-by-Side Diff
 
-MIT License · Copyright © 2026 Matthew Abbott
+Open two Parquet files simultaneously to see a side-by-side comparison:
+
+```bash
+pqr file_v1.parquet file_v2.parquet
+```
+
+This displays both files in split panels, aligning all columns (including columns unique to one file).
+
+---
+
+## Recent Files
+
+pqr tracks the last 10 files you've opened (stored in `~/.pqr_history`). Run `pqr` with no arguments to bring up the recent files picker, with file existence status shown for each entry. From the recent files screen, you can also launch the file browser to find new files.
+
+---
+
+## Compressed JSONL (`.zst`) Support
+
+`.zst` files (zstandard-compressed JSON lines) are supported with a **lazy streaming reader** that:
+
+1. **Samples the first 100 MB** of compressed data to build an instant index: row count, column names, and data types.
+2. **Streams rows on-demand** as you navigate, without decompressing the entire file.
+3. **Flattens nested JSON** into dot-separated column names (e.g. `user.name`, `items.price`).
+4. **Handles arrays** by serializing them as JSON strings.
+5. Supports all TUI operations: search, filter, sort, stats, SQL, edit, and export.
+
+Install with `pip install zstandard`.
+
+---
+
+## Clipboard (Yank)
+
+The `y` key (and `yank` step) copies cell values to your system clipboard using a robust fallback chain:
+
+1. **xclip** (Linux X11)
+2. **wl-copy** (Linux Wayland)
+3. **pbcopy** (macOS)
+4. **clip** (Windows)
+5. **OSC 52** terminal sequence (works over SSH, tmux, and in multiplexers)
+
+No extra Python packages are needed. The OSC 52 fallback automatically detects tmux client TTY and SSH sessions.
+
+---
+
+## Status Bar
+
+The bottom status bar shows live context as you navigate:
+
+- File name, row count, column count
+- Current row position (`row 42/10000`)
+- Current column name
+- Edit count
+- Live numeric column stats: mean, min, max, null count
+
+---
+
+## How It Works
+
+1. Loads `.parquet` files via `pyarrow` into a `pandas.DataFrame`. Files over 5,000 rows use **lazy row-group loading** for efficient memory usage.
+2. Loads `.zst` files with a **streaming reader** that indexes the file header then fills a row cache on-demand.
+3. Renders data in a `textual` `DataTable` with cursor tracking and zebra-striped rows.
+4. Cell edits are captured in an overlay screen with **type-aware conversion** back to the original data type.
+5. The **step pipeline** processes operations sequentially: each step receives the current data state and produces a new one. The same pipeline powers both the CLI batch mode and TUI commands.
+6. On save (`w`), marked rows are dropped and edited cells are type-converted before writing to a new `<filename>_edited.parquet` (or `.edited.jsonl`) file.
+7. Search (`/`) highlights matches across the visible viewport and lets you navigate between them with `n`/`N`.
+
+---
+
+## License
+
+MIT License. Copyright (c) 2026 Matthew Abbott.
+
+## Author
+
+**Matthew Abbott** — mattbachg@gmail.com
