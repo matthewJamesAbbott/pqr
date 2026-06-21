@@ -1319,6 +1319,32 @@ class PlainDataTable(DataTable):
         return Text(str(value), no_wrap=True)
 
 
+class LazyDataTable(PlainDataTable):
+    """DataTable that delegates navigation to parent app for lazy-loaded data."""
+
+    def __init__(self, parent: "ParquetReader", *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._app_ref = parent
+
+    def action_cursor_down(self) -> None:
+        self._app_ref.action_down()
+
+    def action_cursor_up(self) -> None:
+        self._app_ref.action_up()
+
+    def action_cursor_left(self) -> None:
+        self._app_ref.action_left()
+
+    def action_cursor_right(self) -> None:
+        self._app_ref.action_right()
+
+    def action_page_down(self) -> None:
+        self._app_ref.action_page_down()
+
+    def action_page_up(self) -> None:
+        self._app_ref.action_page_up()
+
+
 # ---------------------------------------------------------------------------
 # DiffScreen — side-by-side diff of two parquet files
 # ---------------------------------------------------------------------------
@@ -1476,6 +1502,15 @@ class ParquetReader(App[None]):
         }
     """
 
+    @staticmethod
+    def _calc_visible_rows() -> int:
+        try:
+            import os
+            rows = os.get_terminal_size().lines
+        except Exception:
+            rows = 24
+        return max(rows - 3, 10)
+
     def __init__(self, path: str | None = None, path2: str | None = None) -> None:
         super().__init__()
         self._path: Path | None = Path(path) if path else None
@@ -1494,7 +1529,8 @@ class ParquetReader(App[None]):
         self._zst_reader: LazyJsonlReader | None = None
         self._num_rows: int = 0
         self._lazy: bool = False
-        self._visible_rows: int = 30
+        self._visible_rows: int = self._calc_visible_rows()
+        self._view_offset: int = 0
         self._filter_active: bool = False
         self._filter_df: pd.DataFrame | None = None
         self._search_pattern: str | None = None
@@ -1601,6 +1637,7 @@ class ParquetReader(App[None]):
         self._zst_reader = None
         self._num_rows = 0
         self._lazy = False
+        self._view_offset = 0
         self._filter_active = False
         self._filter_df = None
         self._search_pattern = None
@@ -1651,19 +1688,20 @@ class ParquetReader(App[None]):
         self._all_columns = self._zst_reader.columns
 
         self._lazy = True
+        self._view_offset = 0
 
         # Load initial chunk
         self._df = self._zst_reader.get_row_range(0, min(self._visible_rows, self._num_rows))
         self._col_names = self._all_columns
         self._types = {c: self._zst_reader.dtypes.get(c, "object") for c in self._all_columns}
 
-        dt = PlainDataTable(show_cursor=True, zebra_stripes=True)
+        dt = LazyDataTable(self, show_cursor=True, zebra_stripes=True)
         self._col_keys = dt.add_columns(*self._all_columns)
         self._dt = dt
         self.mount(dt)
 
         self._mount_bars()
-        self._render_zst_visible_rows(0, min(self._visible_rows, self._num_rows))
+        self._render_zst_visible_rows(self._view_offset, min(self._view_offset + self._visible_rows, self._num_rows))
         self._update_status()
 
     def _notify_zstd_missing(self) -> None:
@@ -1677,6 +1715,7 @@ class ParquetReader(App[None]):
     def _load_lazy_initial(self) -> None:
         if self._parquet_file is None:
             return
+        self._view_offset = 0
         table = self._parquet_file.read_row_group(0)
         self._df = table.to_pandas()
 
@@ -1684,13 +1723,13 @@ class ParquetReader(App[None]):
         self._col_names = col_names
         self._types = {c: str(t) for c, t in self._df.dtypes.to_dict().items()}
 
-        dt = PlainDataTable(show_cursor=True, zebra_stripes=True)
+        dt = LazyDataTable(self, show_cursor=True, zebra_stripes=True)
         self._col_keys = dt.add_columns(*col_names)
         self._dt = dt
         self.mount(dt)
 
         self._mount_bars()
-        self._render_visible_rows(0, min(self._visible_rows, self._num_rows))
+        self._render_visible_rows(self._view_offset, min(self._view_offset + self._visible_rows, self._num_rows))
 
     def _render_zst_visible_rows(self, start: int, end: int) -> None:
         if self._zst_reader is None:
@@ -1896,13 +1935,36 @@ class ParquetReader(App[None]):
         except Exception:
             pass
 
+    def on_resize(self, event) -> None:
+        new_rows = self._calc_visible_rows()
+        if self._lazy and self._dt is not None and new_rows != self._visible_rows:
+            self._visible_rows = new_rows
+            if self._view_offset + new_rows > self._num_rows:
+                self._view_offset = max(0, self._num_rows - new_rows)
+            self._refetch_visible()
+        else:
+            self._visible_rows = new_rows
+
     # -- navigation ----------------------------------------------------------
 
     def action_down(self) -> None:
+        if self._lazy and self._dt is not None:
+            row = self._dt.cursor_row or 0
+            if row >= self._dt.row_count - 1 and self._view_offset + self._dt.row_count < self._num_rows:
+                self._view_offset += self._visible_rows
+                self._refetch_visible()
+                return
         self._dt.move_cursor(row=(self._dt.cursor_row or 0) + 1)
         self._on_cursor_moved()
 
     def action_up(self) -> None:
+        if self._lazy and self._dt is not None:
+            row = self._dt.cursor_row or 0
+            if row == 0 and self._view_offset > 0:
+                self._view_offset = max(0, self._view_offset - self._visible_rows)
+                self._refetch_visible()
+                self._dt.move_cursor(row=self._dt.row_count - 1)
+                return
         self._dt.move_cursor(row=(self._dt.cursor_row or 0) - 1)
         self._on_cursor_moved()
 
@@ -1915,27 +1977,40 @@ class ParquetReader(App[None]):
         self._on_cursor_moved()
 
     def action_home(self) -> None:
+        if self._lazy:
+            self._view_offset = 0
+            self._refetch_visible()
         if self._dt.row_count:
             self._dt.cursor_coordinate = (0, 0)
         self._on_cursor_moved()
 
     def action_end(self) -> None:
-        nr = self._num_rows if self._lazy else (len(self._df) if self._df is not None else 0)
+        if self._lazy:
+            nr = self._num_rows
+            self._view_offset = max(0, nr - self._visible_rows)
+            self._refetch_visible()
         col = self._dt.cursor_column or 0
+        nr = self._num_rows if self._lazy else (len(self._df) if self._df is not None else 0)
         if nr:
-            self._dt.cursor_coordinate = (nr - 1, col)
+            self._dt.cursor_coordinate = (min(self._dt.row_count - 1, nr - 1), col)
         self._on_cursor_moved()
 
     def action_page_down(self) -> None:
-        self._dt.scroll_page_down()
         if self._lazy:
+            self._view_offset += self._visible_rows
+            if self._view_offset + self._visible_rows > self._num_rows:
+                self._view_offset = max(0, self._num_rows - self._visible_rows)
             self._refetch_visible()
+        else:
+            self._dt.scroll_page_down()
         self._on_cursor_moved()
 
     def action_page_up(self) -> None:
-        self._dt.scroll_page_up()
         if self._lazy:
+            self._view_offset = max(0, self._view_offset - self._visible_rows)
             self._refetch_visible()
+        else:
+            self._dt.scroll_page_up()
         self._on_cursor_moved()
 
     def _on_cursor_moved(self) -> None:
@@ -1944,11 +2019,7 @@ class ParquetReader(App[None]):
     def _refetch_visible(self) -> None:
         if not self._lazy or self._dt is None:
             return
-        try:
-            viewport_row = self._dt.offset_row
-        except Exception:
-            viewport_row = self._dt.cursor_row or 0
-        start = viewport_row
+        start = self._view_offset
         end = start + self._visible_rows
         if self._zst_reader is not None:
             self._render_zst_visible_rows(start, end)
