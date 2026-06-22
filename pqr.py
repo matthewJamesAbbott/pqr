@@ -857,7 +857,7 @@ class EditScreen(Screen[bool]):
         self._append = append
 
     def compose(self) -> ComposeResult:
-        yield Label(f" [{self._col_key}]  row {self._row_idx}", id="ed-label")
+        yield Label(f" [{self._col_key}]  row {self._row_idx + 1}", id="ed-label")
         yield Input(id="ed-input", value=self._value)
 
     def on_mount(self) -> None:
@@ -2355,11 +2355,15 @@ class ParquetReader(App[None]):
         if info is None:
             return
         ri, ci, display, rk, ck = info
-        key = (ri, ci)
+        if self._lazy:
+            abs_row = self._view_offset + ri
+        else:
+            abs_row = ri
+        key = (abs_row, ci)
         current = self._edited.get(key, self._raw.get(key, display))
         original = self._origins.get(key, self._raw.get(key, display))
         self.push_screen(
-            EditScreen(self, ri, ci, current, original, rk, ck, append),
+            EditScreen(self, abs_row, ci, current, original, str(abs_row), ck, append),
             callback=self._edit_callback,
         )
 
@@ -2375,7 +2379,12 @@ class ParquetReader(App[None]):
             return
         row = dt.cursor_row
         col = dt.cursor_column
-        text_str = self._raw.get((row, col), "")
+        if self._lazy:
+            abs_row = self._view_offset + row
+        else:
+            abs_row = row
+        ci = col - 1 if col > 0 else 0
+        text_str = self._raw.get((abs_row, ci), "")
         self.push_screen(ViewCellScreen(text_str))
 
     def edit_cell(
@@ -2392,8 +2401,12 @@ class ParquetReader(App[None]):
             self._origins[key] = original
         self._edited[key] = new_value
         dt = self._dt
-        rkey = self._row_keys[row_idx]
-        ckey = self._col_keys[col_idx]
+        if self._lazy:
+            local_row = row_idx - self._view_offset
+        else:
+            local_row = row_idx
+        rkey = self._row_keys[local_row]
+        ckey = self._col_keys[col_idx + 1]
         dt.update_cell(rkey, ckey, new_value)
         self._update_status()
 
@@ -2965,7 +2978,11 @@ class ParquetReader(App[None]):
         if info is None:
             return
         ri, ci, display, rk, ck = info
-        self._clipboard = self._raw.get((ri, ci), display)
+        if self._lazy:
+            abs_row = self._view_offset + ri
+        else:
+            abs_row = ri
+        self._clipboard = self._raw.get((abs_row, ci), display)
         if self._copy_to_clipboard(self._clipboard):
             self.notify(f"[green]Yanked:[/green] {self._clipboard[:80]}")
         else:
