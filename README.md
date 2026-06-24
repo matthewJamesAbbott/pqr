@@ -1,5 +1,7 @@
 # pqr — Parquet & JSONL Viewer & Editor
 
+### still under development
+
 A fast, keyboard-driven terminal application for inspecting, querying, and editing Apache Parquet and zstandard-compressed JSONL (`.zst`) files. Built on the [Textual](https://textual.textualize.io/) TUI framework. Think of it as "less" or "vim" but for columnar data.
 
 ## Architecture
