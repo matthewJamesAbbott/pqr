@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pqr"
+version = "0.2.0"
+description = "Parquet & JSONL viewer/editor — vim-like TUI for .parquet files"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Matthew Abbott", email = "mattbachg@gmail.com"}]
+dependencies = [
+    "pandas",
+    "pyarrow",
+    "textual",
+    "rich",
+]
+
+[project.optional-dependencies]
+sql = ["duckdb"]
+excel = ["openpyxl"]
+zst = ["zstandard"]
+all = ["duckdb", "openpyxl", "zstandard"]
+
+[project.scripts]
+pqr = "pqr.app.tui:cli"
+
+[tool.setuptools.packages.find]
+include = ["pqr*"]

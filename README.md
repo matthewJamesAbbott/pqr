@@ -2,15 +2,18 @@
 
 A fast, keyboard-driven terminal application for inspecting, querying, and editing Apache Parquet and zstandard-compressed JSONL (`.zst`) files. Built on the [Textual](https://textual.textualize.io/) TUI framework. Think of it as "less" or "vim" but for columnar data.
 
-# still under development
+## Architecture
 
-![PQR 1](pqr1.png)
+pqr is a modular Python package refactored from a monolith using design patterns:
 
-![PQR 2](pqr2.png)
-
-![PQR 3](pqr3.png)
-
-![PQR 4](pqr4.png)
+| Layer | Pattern | Module |
+|-------|---------|--------|
+| Data IO | Bridge | `pqr/io/reader.py` — `Reader` ABC, `ParquetReader`, `JsonlReader` |
+| Init | Factory | `ReaderFactory.create(path)` picks the right reader |
+| Context | State | `pqr/pipeline/state.py` — `PipelineState` holds df, schema, path, reader |
+| Steps | Command | `pqr/commands/` — 12 command classes (SchemaCmd, SearchCmd, etc.) |
+| Orchestrator | Facade | `pqr/app/facade.py` — `PQRSTask.open()`, `.run()`, `.save()` |
+| UI | (Textual App) | `pqr/app/tui.py` — `ParquetReaderApp` + screens |
 
 ---
 
@@ -44,6 +47,48 @@ pqr data_folder/
 
 ---
 
+## Installation
+
+Requires **Python 3.9+**.
+
+### Option A: Quick install (recommended)
+
+From the project root directory, run the install script:
+
+```bash
+bash scripts/install.sh              # installs into 'ml' conda env
+bash scripts/install.sh --all         # + optional deps (duckdb, openpyxl, zstandard)
+bash scripts/install.sh --base        # installs into base Python env (no conda)
+```
+
+The `--all` flag installs everything; omit it to add optional packages later.
+
+### Option B: Manual install
+
+```bash
+# 1. Install core dependencies
+pip install pandas pyarrow textual rich
+
+# 2. (Optional) Install extras for SQL, Excel export, and .zst files
+pip install duckdb openpyxl zstandard
+
+# 3. Install pqr in editable mode (from project root)
+pip install -e .
+```
+
+Once installed, `pqr` is available from any directory on your PATH.
+
+### Option C: Python module invocation
+
+Without installing, run directly from the project directory:
+
+```bash
+python -m pqr data.parquet
+python -m pqr data.parquet --schema
+```
+
+---
+
 ## Supported File Formats
 
 | Format | Extension | Notes |
@@ -52,37 +97,6 @@ pqr data_folder/
 | Compressed JSONL | `.zst` | Zstandard-compressed JSON lines, lazy-streaming reader |
 
 Both formats support all TUI features: navigation, editing, search, filtering, sorting, SQL, stats, and export.
-
----
-
-## Installation
-
-Requires Python 3.9+ and the following core dependencies:
-
-```bash
-pip install pandas pyarrow textual
-```
-
-Optional dependencies:
-
-```bash
-# SQL query mode (press : in the TUI or use --sql)
-pip install duckdb
-
-# Excel export support
-pip install openpyxl
-
-# Compressed JSONL (.zst) file support
-pip install zstandard
-```
-
-No external clipboard dependency is required. `pqr` uses a robust multi-backend clipboard system (xclip, wl-copy, pbcopy, clip, OSC 52) with tmux and SSH awareness, requiring no extra packages.
-
-Copy or symlink `pqr` to a directory in your `PATH`, or run it directly:
-
-```bash
-python3 pqr data.parquet
-```
 
 ---
 
@@ -127,6 +141,41 @@ pqr data.parquet --step "filter:price > 100" --tui
 ```
 
 Run `pqr --help` for the full list of CLI options.
+
+### Python API
+
+```python
+# Batch pipeline
+from pqr import PQRSTask
+
+task = PQRSTask("data.parquet")
+task.add_step("schema")
+task.add_step("stats")
+results = task.run()          # list[StepResult]
+
+# Direct command execution
+from pqr import Pipeline, Step, PQRSTask
+
+pipeline = Pipeline()
+pipeline.add_spec("filter:page_num > 100")
+pipeline.add_spec("export:format=csv;output=out.csv")
+
+state = PQRSTask.build_state("data.parquet")
+results = pipeline.run(state)
+
+# Data readers (Bridge pattern)
+from pqr import ReaderFactory
+
+reader = ReaderFactory.create("data.parquet")   # auto-detects format
+df_chunk = reader.get_row_range(0, 100)
+print(reader.num_rows, reader.columns)
+
+# TUI programmatically
+from pqr import ParquetReaderApp
+
+app = ParquetReaderApp("data.parquet")
+app.run()
+```
 
 ---
 
@@ -305,7 +354,7 @@ pqr tracks the last 10 files you've opened (stored in `~/.pqr_history`). Run `pq
 4. **Handles arrays** by serializing them as JSON strings.
 5. Supports all TUI operations: search, filter, sort, stats, SQL, edit, and export.
 
-Install with `pip install zstandard`.
+Requires `zstandard`: `pip install zstandard`.
 
 ---
 
@@ -337,13 +386,15 @@ The bottom status bar shows live context as you navigate:
 
 ## How It Works
 
-1. Loads `.parquet` files via `pyarrow` into a `pandas.DataFrame`. Files over 5,000 rows use **lazy row-group loading** for efficient memory usage.
-2. Loads `.zst` files with a **streaming reader** that indexes the file header then fills a row cache on-demand.
-3. Renders data in a `textual` `DataTable` with cursor tracking and zebra-striped rows.
-4. Cell edits are captured in an overlay screen with **type-aware conversion** back to the original data type.
-5. The **step pipeline** processes operations sequentially: each step receives the current data state and produces a new one. The same pipeline powers both the CLI batch mode and TUI commands.
-6. On save (`w`), marked rows are dropped and edited cells are type-converted before writing to a new `<filename>_edited.parquet` (or `.edited.jsonl`) file.
-7. Search (`/`) highlights matches across the visible viewport and lets you navigate between them with `n`/`N`.
+1. `ReaderFactory.create(path)` picks `ParquetReader` or `JsonlReader` based on file extension.
+2. For `.parquet` files, `ParquetReader` uses PyArrow for metadata and lazy row-group loading (5,000+ row files).
+3. For `.zst` files, `JsonlReader` samples the first 100 MB compressed to build an instant index, then streams rows on-demand.
+4. The `Pipeline` orchestrates `Command` objects: each step is its own class with an `execute(state)` method that transforms `PipelineState`.
+5. The `PQRSTask` facade provides a high-level API (`build_state()`, `run()`) used by both CLI and Python API.
+6. The TUI (`ParquetReaderApp`) renders data in a Textual `DataTable` with cursor tracking and zebra-striped rows.
+7. Cell edits are captured in an overlay screen with **type-aware conversion** back to the original data type.
+8. On save (`w`), marked rows are dropped and edited cells are type-converted before writing to a new `<filename>_edited.parquet` (or `.edited.jsonl`) file.
+9. Search (`/`) highlights matches across the visible viewport and lets you navigate between them with `n`/`N`.
 
 ---
 
