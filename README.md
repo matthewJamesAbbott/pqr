@@ -1,7 +1,5 @@
 # pqr — Parquet & JSONL Viewer & Editor
 
-### still under development
-
 A fast, keyboard-driven terminal application for inspecting, querying, and editing Apache Parquet and zstandard-compressed JSONL (`.zst`) files. Built on the [Textual](https://textual.textualize.io/) TUI framework. Think of it as "less" or "vim" but for columnar data.
 
 ## Architecture
@@ -113,7 +111,7 @@ pqr data_folder/          # Browse .parquet and .zst files in a directory
 pqr v1.parquet v2.parquet # Side-by-side diff view
 ```
 
-The TUI provides full vim-style navigation, cell editing, in-place search, column filtering, sorting, statistics, SQL queries, export, and clipboard integration.
+The TUI provides full vim-style navigation, cell editing, in-place search, column filtering, sorting, statistics, SQL queries, export, multi-tab file viewing, and clipboard integration.
 
 ### Batch Mode (no TUI)
 
@@ -256,6 +254,10 @@ pqr data.parquet --shortcut highvalue
 
 When opened without `--step`, pqr launches the full interactive terminal UI.
 
+### Layout
+
+The screen layout maximizes data display: the DataTable fills the full terminal area with the Header bar hidden. A 3-line **shortcut shelf** at the bottom displays all available keyboard shortcuts organized by category (Navigation, Tabs, Operations). Tab switching is keyboard-only — no visible tab bar — giving maximum vertical space for data rows.
+
 ### Navigation
 
 | Key | Action |
@@ -317,8 +319,18 @@ Saves apply all cell edits, type conversions, and row deletions to a new file al
 |-----|--------|
 | `Tab` / `gt` | Next tab |
 | `Shift+Tab` / `gT` | Previous tab |
+| `Ctrl+N` | New tab (browse for a file) |
+| `Ctrl+X` | Close current tab |
+| `Ctrl+O` | Open file into a new tab |
+| `1` — `9` | Jump to tab 1 through 9 |
 
-Open multiple files in tabs by using the file browser (`o`). Switch between tabs to compare datasets without quitting.
+Open multiple files across tabs by pressing `Ctrl+O` or `Ctrl+N` to browse for files. Switch between tabs to compare datasets without quitting. Tab state is preserved — each tab retains its own file, cursor position, and edits.
+
+### Commands
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+P` | Open the Textual command palette |
 
 ### Other
 
@@ -397,6 +409,7 @@ The bottom status bar shows live context as you navigate:
 7. Cell edits are captured in an overlay screen with **type-aware conversion** back to the original data type.
 8. On save (`w`), marked rows are dropped and edited cells are type-converted before writing to a new `<filename>_edited.parquet` (or `.edited.jsonl`) file.
 9. Search (`/`) highlights matches across the visible viewport and lets you navigate between them with `n`/`N`.
+10. **Multi-tab support**: open multiple files as tabs (`Ctrl+O`, `Ctrl+N`), switch between them (`Tab`, `1-9`), and close tabs (`Ctrl+X`). Each tab preserves its own file data and state.
 
 ---
 

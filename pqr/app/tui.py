@@ -19,7 +19,7 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.events import MouseScrollUp, MouseScrollDown, MouseScrollLeft, MouseScrollRight
 from textual.widgets import (
-    DataTable, Footer, Input, Label, RichLog, Static,
+    DataTable, Footer, Input, Label, RichLog, Static, Tab, TabPane,
     DirectoryTree,
 )
 from textual.containers import Container, ScrollableContainer
@@ -649,6 +649,78 @@ class ExportScreen(Screen[Optional[str]]):
 
 
 # ---------------------------------------------------------------------------
+# TabBar
+# ---------------------------------------------------------------------------
+class TabBar(Container):
+    """Vim-style tab bar showing open file tabs."""
+    class TabActivated(Message):
+        def __init__(self, index: int) -> None:
+            super().__init__()
+            self.index = index
+    CSS = """
+        height: 1;
+        width: 100%;
+        background: $surface-darken-1;
+        layout: horizontal;
+        tab-item {
+            height: 1;
+            width: auto;
+            min-width: 15;
+            max-width: 30;
+            content-align: center middle;
+            background: $surface;
+            color: $text;
+            border: none;
+            padding: 0 1;
+            text-overflow: ellipsis;
+        }
+        tab-item.active {
+            background: $accent;
+            color: $surface;
+        }
+        tab-item:hover {
+            background: $boost;
+        }
+        #tab-new {
+            height: 1;
+            width: 3;
+            min-width: 3;
+            content-align: center middle;
+            background: $accent;
+            color: $surface;
+        }
+    """
+    def __init__(self) -> None:
+        super().__init__(id="tab-bar")
+        self._active_name = ""
+    def set_tabs(self, tabs: list[dict], active: int) -> None:
+        if tabs and 0 <= active < len(tabs):
+            self._active_name = Path(tabs[active]["path"]).name
+        # Sync removal: clear NodeList internals directly
+        self._nodes._nodes.clear()
+        self._nodes._nodes_by_id.clear()
+        self._nodes._nodes_set.clear()
+        self._nodes.updated()
+        for i, tab in enumerate(tabs):
+            name = Path(tab["path"]).name
+            closed = "[red]x[/red]" if not Path(tab["path"]).exists() else ""
+            label = Static(f"{name}{closed}", classes=f"tab-item{' active' if i == active else ''}")
+            label._tab_index = i
+            self.mount(label)
+        new_tab = Static("[green]+[/green]", id="tab-new")
+        self.mount(new_tab)
+
+    def on_click(self, event: "textual.events.Click") -> None:
+        widget = event.mouse.device
+        if hasattr(widget, "_tab_index"):
+            self.post_message(TabBar.TabActivated(widget._tab_index))
+        elif widget.id == "tab-new":
+            self.post_message(TabBar.TabActivated(-1))
+
+    # Tab/Shift+Tab handled by app-level bindings, not widget focus
+
+
+# ---------------------------------------------------------------------------
 # FilterBar
 # ---------------------------------------------------------------------------
 class FilterBar(Input):
@@ -955,7 +1027,6 @@ class ParquetReaderApp(App[None]):
         Binding("o", "open_file", "Open"),
         Binding("O", "add_row", "AddRow"),
         Binding("dd", "delete_row", "DelRow"),
-        Binding("ctrl+o", "open_file", "Open"),
         Binding("s", "sort_column", "Sort"),
         Binding("S", "schema", "Schema"),
         Binding("/", "search", "Search"),
@@ -969,23 +1040,47 @@ class ParquetReaderApp(App[None]):
         Binding("shift+tab", "prev_tab", "PrevTab"),
         Binding("gt", "next_tab", "NextTab"),
         Binding("gT", "prev_tab", "PrevTab"),
+        Binding("ctrl+n", "new_tab", "NewTab"),
+        Binding("ctrl+x", "close_tab", "CloseTab"),
+        Binding("ctrl+o", "open_file_tab", "OpenTab"),
+        Binding("1", "goto_tab_1", "Tab1"),
+        Binding("2", "goto_tab_2", "Tab2"),
+        Binding("3", "goto_tab_3", "Tab3"),
+        Binding("4", "goto_tab_4", "Tab4"),
+        Binding("5", "goto_tab_5", "Tab5"),
+        Binding("6", "goto_tab_6", "Tab6"),
+        Binding("7", "goto_tab_7", "Tab7"),
+        Binding("8", "goto_tab_8", "Tab8"),
+        Binding("9", "goto_tab_9", "Tab9"),
         Binding("q", "quit", "Quit"),
     ]
     CSS = """
         Screen {
-            layout: grid;
-            grid-size: 1;
-            grid-rows: 1fr;
+            layout: vertical;
+        }
+        Header {
+            height: 0;
+            visibility: hidden;
+        }
+        Footer {
+            height: 0;
+            visibility: hidden;
+        }
+        #tab-bar {
+            height: 0;
+            visibility: hidden;
+        }
+        #textual-toastrack {
+            height: 0;
+            visibility: hidden;
+        }
+        #textual-tooltip {
+            height: 0;
+            visibility: hidden;
         }
         DataTable {
-            height: 100%;
+            height: 1fr;
             width: 100%;
-        }
-        #status-bar {
-            dock: bottom;
-            height: 1;
-            background: $boost;
-            color: $text;
         }
         #filter-bar {
             dock: top;
@@ -993,6 +1088,12 @@ class ParquetReaderApp(App[None]):
             background: $accent;
             color: $surface;
             visibility: hidden;
+        }
+        #status-bar {
+            dock: bottom;
+            height: 1;
+            background: $boost;
+            color: $text;
         }
         #search-bar {
             dock: bottom;
@@ -1003,12 +1104,12 @@ class ParquetReaderApp(App[None]):
         }
         #footer-shelf {
             dock: bottom;
-            height: 2;
+            height: 3;
             background: $boost;
             color: $text;
             padding: 0 1;
             overflow: hidden hidden;
-            content-align: left middle;
+            content-align: left top;
             text-overflow: ellipsis;
         }
     """
@@ -1059,6 +1160,7 @@ class ParquetReaderApp(App[None]):
         self._clipboard: str = ""
         self._tabs: list[dict] = []
         self._active_tab: int = -1
+        self._tab_bar: TabBar | None = None
         self._startup_df: pd.DataFrame | None = None
         self._startup_schema: pa.Schema | None = None
 
@@ -1091,6 +1193,8 @@ class ParquetReaderApp(App[None]):
             await self._open_zst(str(target))
         else:
             await self._open_parquet(str(target))
+        self._save_tab_state()
+        self._refresh_tab_bar()
 
     async def _on_file_chosen(self, path: str | None) -> None:
         if path:
@@ -1099,26 +1203,31 @@ class ParquetReaderApp(App[None]):
                 self.push_screen(DirBrowserScreen(str(self._path)), callback=self._on_file_chosen)
             else:
                 await self._clear_widgets()
-                self._reset_state()
+                self._reset_state(keep_tabs=True)
                 if _is_zst_file(path):
                     await self._open_zst(path)
                 else:
                     await self._open_parquet(path)
+                self._save_tab_state()
+                self._refresh_tab_bar()
 
     async def _clear_widgets(self) -> None:
         screen = self.screen
         to_remove = []
-        for widget_id in ("filter-bar", "status-bar", "search-bar", "search-prompt"):
+        for widget_id in ("tab-bar", "filter-bar", "status-bar", "search-bar", "search-prompt", "footer-shelf"):
             for w in screen.query(f"#{widget_id}"):
-                to_remove.append(w)
+                if w not in to_remove:
+                    to_remove.append(w)
         for w in screen.query(Footer):
-            to_remove.append(w)
+            if w not in to_remove:
+                to_remove.append(w)
         for w in screen.query(DataTable):
-            to_remove.append(w)
+            if w not in to_remove:
+                to_remove.append(w)
         for w in to_remove:
             await w.remove()
 
-    def _reset_state(self) -> None:
+    def _reset_state(self, keep_tabs: bool = False) -> None:
         self._df = None
         self._dt = None
         self._types = {}
@@ -1151,8 +1260,10 @@ class ParquetReaderApp(App[None]):
         self._sort_col = None
         self._sort_asc = True
         self._clipboard = ""
-        self._tabs = []
-        self._active_tab = -1
+        if not keep_tabs:
+            self._tabs = []
+            self._active_tab = -1
+            self._tab_bar = None
 
     async def _open_parquet(self, path: str) -> None:
         _add_to_history(path)
@@ -1256,6 +1367,7 @@ class ParquetReaderApp(App[None]):
                 self._raw[(ri, ci)] = self._full(v)
 
     def _mount_bars(self) -> None:
+        self._tab_bar = None
         filter_bar = FilterBar(id="filter-bar", placeholder="Filter (col == value)... press f to toggle")
         self.mount(filter_bar)
         self._filter_bar = filter_bar
@@ -1269,6 +1381,14 @@ class ParquetReaderApp(App[None]):
         self.mount(shelf)
         self._footer_shelf = shelf
         self._update_footer_shelf()
+
+    def _refresh_tab_bar(self) -> None:
+        if self._tab_bar is not None:
+            self._tab_bar.set_tabs(self._tabs, self._active_tab)
+            self._tab_bar.refresh()
+        if self._path is not None:
+            self.title = str(self._path)
+        self._update_status()
 
     def _render_visible_rows(self, start: int, end: int) -> None:
         if self._zst_reader is not None:
@@ -1313,8 +1433,6 @@ class ParquetReaderApp(App[None]):
         if clear:
             if self._dt is not None:
                 self._dt.clear(columns=True)
-            else:
-                await self._clear_widgets()
         col_names = list(df.columns)
         self._col_names = col_names
         self._types = {c: str(t) for c, t in df.dtypes.to_dict().items()}
@@ -1521,12 +1639,28 @@ class ParquetReaderApp(App[None]):
     def _update_footer_shelf(self) -> None:
         if hasattr(self, '_footer_shelf') and self._footer_shelf is not None:
             shelf = self._footer_shelf
-            items = []
-            for binding in self.BINDINGS:
-                if binding.show:
-                    key_display = binding.key_display if binding.key_display else binding.key
-                    items.append(f"[cyan]{key_display}[/cyan] {binding.description}")
-            shelf.update(" ".join(items))
+            def fmt(b):
+                kd = b.key_display if b.key_display else b.key
+                return f"[cyan]{kd}[/cyan] {b.description}"
+            nav = [fmt(b) for b in self.BINDINGS
+                   if b.description in ("Down", "Up", "Left", "Right", "Top", "Bottom", "PgDn", "PgUp", "GoRow")]
+            tab = [fmt(b) for b in self.BINDINGS
+                   if b.description in ("NextTab", "PrevTab", "NewTab", "CloseTab", "OpenTab",
+                                        "Tab1", "Tab2", "Tab3", "Tab4", "Tab5",
+                                        "Tab6", "Tab7", "Tab8", "Tab9")]
+            edit = [fmt(b) for b in self.BINDINGS
+                    if b.description in ("Edit", "Append", "View", "Yank", "Save", "Export",
+                                         "Open", "AddRow", "DelRow", "Sort", "Schema",
+                                         "Search", "Next", "Prev", "Filter", "HideCol",
+                                         "Stats", "SQL", "Quit")]
+            lines = []
+            if nav:
+                lines.append(" ".join(nav))
+            if tab:
+                lines.append(" ".join(tab))
+            if edit:
+                lines.append(" ".join(edit) + "  [cyan]ctrl+p[/cyan] Commands")
+            shelf.update("\n".join(lines))
 
     def _get_cell(self) -> tuple[int, int, str, str, str] | None:
         dt = self._dt
@@ -1684,14 +1818,17 @@ class ParquetReaderApp(App[None]):
 
     async def _on_open_file(self, path: Optional[str]) -> None:
         if path and Path(path).exists():
-            self._path = Path(path)
-            _add_to_history(str(self._path))
+            self._save_tab_state()
             await self._clear_widgets()
-            self._reset_state()
+            self._reset_state(keep_tabs=True)
+            self._active_tab = -1
             if _is_zst_file(path):
                 await self._open_zst(path)
             else:
                 await self._open_parquet(path)
+            _add_to_history(str(self._path))
+            self._save_tab_state()
+            self._refresh_tab_bar()
 
     def _build_state(self) -> PipelineState:
         from pqr.io.reader import Reader
@@ -2193,7 +2330,7 @@ class ParquetReaderApp(App[None]):
     def _save_tab_state(self) -> None:
         if self._path is None:
             return
-        if self._active_tab < len(self._tabs):
+        if self._active_tab >= 0 and self._active_tab < len(self._tabs):
             tab = self._tabs[self._active_tab]
             tab["path"] = str(self._path)
             tab["df"] = self._df.copy() if self._df is not None else None
@@ -2207,22 +2344,22 @@ class ParquetReaderApp(App[None]):
         self._active_tab = len(self._tabs) - 1
 
     async def _load_tab_state(self, index: int) -> None:
-        if 0 <= index < len(self._tabs):
-            tab = self._tabs[index]
-            for t in self._tabs:
-                t["active"] = False
-            tab["active"] = True
-            self._active_tab = index
-            path = tab["path"]
-            self._path = Path(path)
-            self._df = tab.get("df")
-            if self._df is not None:
-                self._num_rows = len(self._df)
-                self._parquet_reader = ParquetReader(path)
-                self._schema = self._parquet_reader.columns
-                self._schema = pq.ParquetFile(path).schema_arrow
-                await self._populate_table(self._df, clear=False)
-                self._update_status()
+        if not (0 <= index < len(self._tabs)):
+            return
+        tab = self._tabs[index]
+        for t in self._tabs:
+            t["active"] = False
+        tab["active"] = True
+        self._active_tab = index
+        path = tab["path"]
+        self._path = Path(path)
+        await self._clear_widgets()
+        self._reset_state(keep_tabs=True)
+        if _is_zst_file(path):
+            await self._open_zst(path)
+        else:
+            await self._open_parquet(path)
+        self._refresh_tab_bar()
 
     async def action_next_tab(self) -> None:
         if len(self._tabs) <= 1:
@@ -2237,6 +2374,83 @@ class ParquetReaderApp(App[None]):
         self._save_tab_state()
         prev_idx = (self._active_tab - 1) % len(self._tabs)
         await self._load_tab_state(prev_idx)
+
+    async def action_new_tab(self) -> None:
+        self._save_tab_state()
+        self.push_screen(
+            FileBrowserScreen("."),
+            callback=lambda path: self._on_open_file_tab(path),
+        )
+
+    async def _on_open_file_tab(self, path: Optional[str]) -> None:
+        if not path:
+            return
+        self._save_tab_state()
+        await self._clear_widgets()
+        self._reset_state(keep_tabs=True)
+        self._active_tab = -1
+        if _is_zst_file(path):
+            await self._open_zst(path)
+        else:
+            await self._open_parquet(path)
+        self._save_tab_state()
+        self._refresh_tab_bar()
+
+    def action_open_file_tab(self) -> None:
+        self.push_screen(
+            FileBrowserScreen("."),
+            callback=lambda path: self._on_open_file_tab(path),
+        )
+
+    async def action_close_tab(self) -> None:
+        if not self._tabs:
+            self.exit()
+            return
+        if self._active_tab < 0 or self._active_tab >= len(self._tabs):
+            self._active_tab = 0
+        self._tabs.pop(self._active_tab)
+        if not self._tabs:
+            self.exit()
+            return
+        if self._active_tab >= len(self._tabs):
+            self._active_tab = len(self._tabs) - 1
+        await self._load_tab_state(self._active_tab)
+
+    async def _goto_tab(self, index: int) -> None:
+        if 0 <= index < len(self._tabs):
+            self._save_tab_state()
+            await self._load_tab_state(index)
+
+    def action_goto_tab_1(self) -> None:
+        asyncio.create_task(self._goto_tab(0))
+    def action_goto_tab_2(self) -> None:
+        asyncio.create_task(self._goto_tab(1))
+    def action_goto_tab_3(self) -> None:
+        asyncio.create_task(self._goto_tab(2))
+    def action_goto_tab_4(self) -> None:
+        asyncio.create_task(self._goto_tab(3))
+    def action_goto_tab_5(self) -> None:
+        asyncio.create_task(self._goto_tab(4))
+    def action_goto_tab_6(self) -> None:
+        asyncio.create_task(self._goto_tab(5))
+    def action_goto_tab_7(self) -> None:
+        asyncio.create_task(self._goto_tab(6))
+    def action_goto_tab_8(self) -> None:
+        asyncio.create_task(self._goto_tab(7))
+    def action_goto_tab_9(self) -> None:
+        asyncio.create_task(self._goto_tab(8))
+
+    async def on_tab_bar_tab_activated(self, event: TabBar.TabActivated) -> None:
+        idx = event.index
+        if idx == -1:
+            self.action_new_tab()
+        elif idx == -2:
+            await self.action_next_tab()
+        elif idx == -3:
+            await self.action_prev_tab()
+        else:
+            self._save_tab_state()
+            await self._load_tab_state(idx)
 
     def action_quit(self) -> None:
         if self._edited:
