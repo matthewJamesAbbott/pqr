@@ -1,3 +1,26 @@
+Metadata-Version: 2.4
+Name: pqr
+Version: 0.2.0
+Summary: Parquet & JSONL viewer/editor — vim-like TUI for .parquet files
+Author-email: Matthew Abbott <mattbachg@gmail.com>
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: pandas
+Requires-Dist: pyarrow
+Requires-Dist: textual
+Requires-Dist: rich
+Provides-Extra: sql
+Requires-Dist: duckdb; extra == "sql"
+Provides-Extra: excel
+Requires-Dist: openpyxl; extra == "excel"
+Provides-Extra: zst
+Requires-Dist: zstandard; extra == "zst"
+Provides-Extra: all
+Requires-Dist: duckdb; extra == "all"
+Requires-Dist: openpyxl; extra == "all"
+Requires-Dist: zstandard; extra == "all"
+
 # pqr — Parquet & JSONL Viewer & Editor
 
 A fast, keyboard-driven terminal application for inspecting, querying, and editing Apache Parquet and zstandard-compressed JSONL (`.zst`) files. Built on the [Textual](https://textual.textualize.io/) TUI framework. Think of it as "less" or "vim" but for columnar data.
@@ -281,9 +304,9 @@ For large files (5,000+ rows for Parquet, all `.zst` files), pqr uses **lazy loa
 | `v` | View full cell contents in a scrollable popup |
 | `y` | Copy cell value to clipboard (yank) |
 | `O` | Add a new empty row (works in lazy mode) |
-| `Ctrl+D` | Delete current row (works in lazy mode) |
+| `dd` | Mark current row for deletion |
 
-Edits are tracked in-memory. Type-aware conversion ensures values are cast back to the correct data type on save. Row deletion works in lazy mode, tracking deleted rows by absolute file index so that the UI remains stable even as rows are removed from the visible page.
+Edits are tracked in-memory. Type-aware conversion ensures values are cast back to the correct data type on save.
 
 ### Saving
 
@@ -301,7 +324,7 @@ Saves apply all cell edits, type conversions, and row deletions. Use `w` for a s
 | `s` | Sort current column (toggles ascending/descending; works on full data even in lazy mode) |
 | `H` | Hide or show current column (toggle) |
 | `x` | Show column statistics (works on full data even in lazy mode) |
-| `/` | Search across all columns (async, non-blocking — works on large files with 79,000+ rows) |
+| `/` | Search across all columns (async, with progress — works on files with 79,000+ rows) |
 | `n` / `N` | Next / previous search match |
 | `f` | Toggle filter bar (pandas query syntax, e.g. `col == value`; works on full data in lazy mode) |
 | `:` | SQL query prompt (requires duckdb) |
@@ -409,7 +432,7 @@ The bottom status bar shows live context as you navigate:
 6. The TUI (`ParquetReaderApp`) renders data in a Textual `DataTable` with cursor tracking and zebra-striped rows. In lazy mode, page navigation uses **incremental cell updates** instead of clearing and rebuilding the entire table.
 7. Cell edits are captured in an overlay screen with **type-aware conversion** back to the original data type.
 8. On save (`w` or `W`), the full dataset is loaded (using the buffered reader for large files), marked rows are dropped, edited cells are type-converted, and the result is written either to a new `_edited` file (`w`) or directly to the current file (`W`).
-9. Search (`/`) runs **asynchronously** via a background task with progress notifications, scanning data in chunks without freezing the UI. Handles array-valued columns gracefully (e.g., lists in object columns).
+9. Search (`/`) runs **asynchronously** with progress notifications, scanning data in chunks without freezing the UI.
 10. **Multi-tab support**: open multiple files as tabs (`Ctrl+O`, `Ctrl+N`), switch between them (`Tab`, `1-9`), and close tabs (`Ctrl+X`). Each tab preserves its own file data and state.
 
 ---

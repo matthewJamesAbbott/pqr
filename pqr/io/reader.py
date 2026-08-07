@@ -32,13 +32,18 @@ class Reader(ABC):
 
 
 class ParquetReader(Reader):
-    """Handles PyArrow/Parquet disk IO."""
+    """Handles PyArrow/Parquet disk IO with a row buffer for large files."""
+
+    BUFFER_SIZE = 64 * 1024  # prefetch 64K rows per buffer load
 
     def __init__(self, path: str) -> None:
         from pqr.common import pq
         self._path = path
         self._pq_file = pq.ParquetFile(path)
         self._metadata = self._pq_file.metadata
+        self._buffer_df: pd.DataFrame | None = None
+        self._buffer_start: int = -1
+        self._buffer_end: int = -1
 
     @property
     def num_rows(self) -> int:
@@ -52,36 +57,58 @@ class ParquetReader(Reader):
     def dtypes(self) -> dict[str, str]:
         return {name: str(t) for name, t in zip(self.columns, self._pq_file.schema_arrow.types)}
 
-    def get_row_range(self, start: int, end: int) -> pd.DataFrame:
-        chunks = []
-        rg = self._metadata
-        row_offset = 0
+    def _fill_buffer(self, target_start: int, target_end: int) -> None:
         col_names = self.columns
+        rg = self._metadata
+        read_start = max(0, target_start - self.BUFFER_SIZE)
+        prefetch = (target_end - target_start) * 2
+        read_end = min(self.num_rows, target_end + prefetch)
+        if self._buffer_df is not None and self._buffer_start <= target_start and self._buffer_end >= target_end:
+            return
+        chunks = []
+        row_offset = 0
         for i in range(rg.num_row_groups):
             rg_size = rg.row_group(i).num_rows
             rg_start = row_offset
             rg_end = row_offset + rg_size
-            if rg_end <= start:
+            if rg_end <= read_start:
                 row_offset = rg_end
                 continue
-            if rg_start >= end:
+            if rg_start >= read_end:
                 break
-            read_start = max(0, start - row_offset)
-            read_end = min(rg_size, end - row_offset)
+            local_start = max(0, read_start - row_offset)
+            local_end = min(rg_size, read_end - row_offset)
             table = self._pq_file.read_row_group(i, columns=col_names, use_threads=True)
-            table = table.slice(read_start, read_end - read_start)
+            table = table.slice(local_start, local_end - local_start)
             chunks.append(table.to_pandas())
             row_offset = rg_end
-
         if chunks:
-            return pd.concat(chunks, ignore_index=True)
-        return pd.DataFrame(columns=col_names)
+            self._buffer_df = pd.concat(chunks, ignore_index=True)
+        else:
+            self._buffer_df = pd.DataFrame(columns=col_names)
+        self._buffer_start = read_start
+        self._buffer_end = read_end
+
+    def get_row_range(self, start: int, end: int) -> pd.DataFrame:
+        self._fill_buffer(start, end)
+        buf = self._buffer_df
+        if buf is None or buf.empty:
+            return pd.DataFrame(columns=self.columns)
+        local_start = start - self._buffer_start
+        local_end = end - self._buffer_start
+        if local_start >= len(buf) or local_end <= 0:
+            return pd.DataFrame(columns=self.columns)
+        local_start = max(0, local_start)
+        local_end = min(len(buf), local_end)
+        return buf.iloc[local_start:local_end].reset_index(drop=True)
 
     async def get_row_range_async(self, start: int, end: int) -> pd.DataFrame:
         return self.get_row_range(start, end)
 
     def close(self) -> None:
-        pass
+        self._buffer_df = None
+        self._buffer_start = -1
+        self._buffer_end = -1
 
 
 class JsonlReader(Reader):

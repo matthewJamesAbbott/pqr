@@ -1,0 +1,2 @@
+[console_scripts]
+pqr = pqr.app.tui:cli

@@ -167,13 +167,18 @@ class ViewCellScreen(Screen[None]):
         self.query_one("#view-container", Container).scroll_down()
     def action_scroll_up(self) -> None:
         self.query_one("#view-container", Container).scroll_up()
-    def on_mount(self) -> None:
-        self.query_one("#view-text", Static).focus()
     def compose(self) -> ComposeResult:
         yield Container(
             Static(self._text, id="view-text", markup=False),
             id="view-container",
         )
+    def on_mount(self) -> None:
+        self.call_later(self._do_focus)
+    def _do_focus(self) -> None:
+        try:
+            self.query_one("#view-text", Static).focus()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -221,10 +226,15 @@ class EditScreen(Screen[bool]):
         yield Label(f" [{self._col_key}]  row {self._row_idx + 1}", id="ed-label")
         yield Input(id="ed-input", value=self._value)
     def on_mount(self) -> None:
-        inp = self.query_one("#ed-input", Input)
-        inp.focus()
-        if self._append:
-            inp.cursor_position = len(inp.value)
+        self.call_later(self._do_focus)
+    def _do_focus(self) -> None:
+        try:
+            inp = self.query_one("#ed-input", Input)
+            inp.focus()
+            if self._append:
+                inp.cursor_position = len(inp.value)
+        except Exception:
+            pass
     def action_confirm(self) -> None:
         new_val = self.query_one("#ed-input", Input).value
         self._parent.edit_cell(
@@ -276,7 +286,12 @@ class SchemaScreen(Screen[None]):
             RichLog(id="schema-log"),
         )
     def on_mount(self) -> None:
-        log = self.query_one("#schema-log", RichLog)
+        self.call_later(self._populate_schema)
+    def _populate_schema(self) -> None:
+        try:
+            log = self.query_one("#schema-log", RichLog)
+        except Exception:
+            return
         meta = pq.read_metadata(self._path)
         log.write(f"[bold cyan]File:[/bold cyan] {self._path}\n")
         log.write(f"[bold cyan]Columns:[/bold cyan] {len(self._schema)}\n")
@@ -617,6 +632,7 @@ class ExportScreen(Screen[Optional[str]]):
         super().__init__()
         self._cursor: int = 0
         self._options = ["csv", "excel", "parquet"]
+        self._refreshed: bool = False
     def action_down(self) -> None:
         self._cursor = min(self._cursor + 1, len(self._options) - 1)
         self._refresh()
@@ -624,11 +640,17 @@ class ExportScreen(Screen[Optional[str]]):
         self._cursor = max(self._cursor - 1, 0)
         self._refresh()
     def _refresh(self) -> None:
+        if self._refreshed:
+            return
+        self._refreshed = True
         for i, opt in enumerate(self._options):
             prefix = ">> " if i == self._cursor else "   "
-            self.query_one(f"#export-opt-{i}", Static).update(
-                f"{prefix}[{opt[0].upper()}] {opt.capitalize()}"
-            )
+            try:
+                self.query_one(f"#export-opt-{i}", Static).update(
+                    f"{prefix}[{opt[0].upper()}] {opt.capitalize()}"
+                )
+            except Exception:
+                pass
     def action_csv(self) -> None:
         self.dismiss("csv")
     def action_excel(self) -> None:
@@ -637,8 +659,6 @@ class ExportScreen(Screen[Optional[str]]):
         self.dismiss("parquet")
     def action_cancel(self) -> None:
         self.dismiss(None)
-    def on_mount(self) -> None:
-        self._refresh()
     def compose(self) -> ComposeResult:
         yield Container(
             Label("Export As (press key):", id="export-title"),
@@ -646,6 +666,8 @@ class ExportScreen(Screen[Optional[str]]):
               for i, o in enumerate(self._options)],
             id="export-container",
         )
+    def on_mount(self) -> None:
+        self.call_later(self._refresh)
 
 
 # ---------------------------------------------------------------------------
@@ -741,9 +763,14 @@ class PlainDataTable(DataTable):
 
 
 class LazyDataTable(PlainDataTable):
+    BINDINGS = [
+        Binding("ctrl+d", "delete_row", "DelRow"),
+    ]
     def __init__(self, parent: "ParquetReaderApp", *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._app_ref = parent
+    def action_delete_row(self) -> None:
+        self._app_ref.action_delete_row()
     def action_cursor_down(self) -> None:
         self._app_ref.action_down()
     def action_cursor_up(self) -> None:
@@ -1023,10 +1050,11 @@ class ParquetReaderApp(App[None]):
         Binding("v", "view_cell", "View"),
         Binding("y", "yank_cell", "Yank"),
         Binding("w", "save", "Save"),
-        Binding("W", "export", "Export"),
+        Binding("W", "save_in_place", "SaveIn"),
+        Binding("E", "export", "Export"),
         Binding("o", "open_file", "Open"),
         Binding("O", "add_row", "AddRow"),
-        Binding("dd", "delete_row", "DelRow"),
+        Binding("ctrl+d", "delete_row", "DelRow"),
         Binding("s", "sort_column", "Sort"),
         Binding("S", "schema", "Schema"),
         Binding("/", "search", "Search"),
@@ -1163,6 +1191,8 @@ class ParquetReaderApp(App[None]):
         self._tab_bar: TabBar | None = None
         self._startup_df: pd.DataFrame | None = None
         self._startup_schema: pa.Schema | None = None
+        self._saved_cursor_row: int | None = None
+        self._saved_cursor_col: int | None = None
 
     # -- mount ---------------------------------------------------------------
     async def on_mount(self) -> None:
@@ -1256,6 +1286,7 @@ class ParquetReaderApp(App[None]):
         self._footer = None
         self._search_bar = None
         self._deleted_rows = set()
+        self._page_delete_count = 0
         self._hidden_cols = set()
         self._sort_col = None
         self._sort_asc = True
@@ -1323,12 +1354,13 @@ class ParquetReaderApp(App[None]):
         self._col_names = col_names
         self._types = {c: str(t) for c, t in self._df.dtypes.to_dict().items()}
         dt = LazyDataTable(self, show_cursor=True, zebra_stripes=True, show_row_labels=True)
-        self._col_keys = dt.add_columns(*col_names)
+        self._col_keys = dt.add_columns("#", *col_names)
         self._dt = dt
         self.mount(dt)
         self._mount_bars()
-        self._render_visible_rows(self._view_offset, min(self._view_offset + self._visible_rows, self._num_rows))
+        self._render_lazy_page(0, min(self._visible_rows, self._num_rows))
         self._update_row_labels()
+        self.call_later(lambda: self._dt.focus())
 
     async def _render_zst_visible_rows_async(self, start: int, end: int) -> None:
         if self._zst_reader is None:
@@ -1337,16 +1369,7 @@ class ParquetReaderApp(App[None]):
         if dt is None:
             return
         df_chunk = await self._zst_reader.get_row_range_async(start, end)
-        dt.clear(columns=True)
-        self._col_keys = dt.add_columns("#", *self._all_columns)
-        rows_data = [
-            [str(idx + 1)] + [self._fmt(v) for v in df_chunk.iloc[idx - start].values]
-            for idx in range(start, min(end, self._num_rows))
-        ]
-        self._row_keys = list(dt.add_rows(rows_data))
-        for ri in range(start, min(end, self._num_rows)):
-            for ci, v in enumerate(df_chunk.iloc[ri - start].values):
-                self._raw[(ri, ci)] = self._full(v)
+        self._update_lazy_cells(dt, start, end, df_chunk, self._all_columns)
 
     def _render_zst_visible_rows(self, start: int, end: int) -> None:
         if self._zst_reader is None:
@@ -1355,16 +1378,7 @@ class ParquetReaderApp(App[None]):
         if dt is None:
             return
         df_chunk = self._zst_reader.get_row_range(start, end)
-        dt.clear(columns=True)
-        self._col_keys = dt.add_columns("#", *self._all_columns)
-        rows_data = [
-            [str(idx + 1)] + [self._fmt(v) for v in df_chunk.iloc[idx - start].values]
-            for idx in range(start, min(end, self._num_rows))
-        ]
-        self._row_keys = list(dt.add_rows(rows_data))
-        for ri in range(start, min(end, self._num_rows)):
-            for ci, v in enumerate(df_chunk.iloc[ri - start].values):
-                self._raw[(ri, ci)] = self._full(v)
+        self._update_lazy_cells(dt, start, end, df_chunk, self._all_columns)
 
     def _mount_bars(self) -> None:
         self._tab_bar = None
@@ -1380,6 +1394,9 @@ class ParquetReaderApp(App[None]):
         shelf = Static("", id="footer-shelf")
         self.mount(shelf)
         self._footer_shelf = shelf
+        search_bar = Label("", id="search-bar")
+        self.mount(search_bar)
+        self._search_bar = search_bar
         self._update_footer_shelf()
 
     def _refresh_tab_bar(self) -> None:
@@ -1390,37 +1407,91 @@ class ParquetReaderApp(App[None]):
             self.title = str(self._path)
         self._update_status()
 
+    def _render_lazy_page(self, start: int, end: int) -> None:
+        if self._parquet_reader is None:
+            return
+        df_chunk = self._get_row_range(start, end)
+        self._update_lazy_cells(self._dt, start, end, df_chunk, self._col_names)
+
+    def _update_lazy_cells(self, dt, start: int, end: int, df_chunk: pd.DataFrame, col_names: list[str]) -> None:
+        if dt is None:
+            return
+        actual_end = min(end, self._num_rows)
+        n_rows = actual_end - start
+        if n_rows <= 0:
+            return
+        if dt.row_count == 0:
+            self._raw.clear()
+            dt.clear(columns=True)
+            import math
+            width = max(len(str(self._num_rows)), 2)
+            self._col_keys = [dt.add_column("#", width=width)] + list(dt.add_columns(*col_names))
+            rows_data = [
+                [str(idx + 1)] + [self._fmt(v) for v in df_chunk.iloc[li].values]
+                for li, idx in enumerate(range(start, actual_end))
+            ]
+            self._row_keys = list(dt.add_rows(rows_data))
+            for ri in range(start, actual_end):
+                for ci, v in enumerate(df_chunk.iloc[ri - start].values):
+                    self._raw[(ri, ci)] = self._full(v)
+            return
+        if dt.row_count != n_rows:
+            self._raw.clear()
+            dt.clear(columns=True)
+            width = max(len(str(self._num_rows)), 2)
+            self._col_keys = [dt.add_column("#", width=width)] + list(dt.add_columns(*col_names))
+            rows_data = [
+                [str(idx + 1)] + [self._fmt(v) for v in df_chunk.iloc[li].values]
+                for li, idx in enumerate(range(start, actual_end))
+            ]
+            self._row_keys = list(dt.add_rows(rows_data))
+            for ri in range(start, actual_end):
+                for ci, v in enumerate(df_chunk.iloc[ri - start].values):
+                    self._raw[(ri, ci)] = self._full(v)
+            return
+        for li, ri in enumerate(range(start, actual_end)):
+            if li >= len(self._row_keys):
+                break
+            rkey = self._row_keys[li]
+            try:
+                dt.labeled_row(rkey, str(ri + 1))
+            except Exception:
+                pass
+            try:
+                dt.update_cell(rkey, self._col_keys[0], str(ri + 1))
+            except Exception:
+                pass
+            for ci, v in enumerate(df_chunk.iloc[li].values):
+                ckey = self._col_keys[ci + 1] if ci + 1 < len(self._col_keys) else None
+                if ckey is None:
+                    break
+                display = self._fmt(v)
+                self._raw[(ri, ci)] = self._full(v)
+                try:
+                    dt.update_cell(rkey, ckey, display)
+                except Exception:
+                    pass
+        self._dt.refresh()
+
     def _render_visible_rows(self, start: int, end: int) -> None:
         if self._zst_reader is not None:
             self._render_zst_visible_rows(start, end)
             return
-        if self._lazy and self._parquet_reader is None:
+        if self._lazy:
+            self._render_lazy_page(start, end)
+            return
+        if self._df is None:
             return
         dt = self._dt
         if dt is None:
             return
-        if self._lazy:
-            df_chunk = self._get_row_range(start, end)
-            dt.clear(columns=True)
-            self._col_keys = dt.add_columns("#", *self._col_names)
-            rows_data = [
-                [str(idx + 1)] + [self._fmt(v) for v in df_chunk.iloc[idx - start].values]
-                for idx in range(start, min(end, self._num_rows))
-            ]
-            self._row_keys = list(dt.add_rows(rows_data))
-            for ri in range(start, min(end, self._num_rows)):
-                for ci, v in enumerate(df_chunk.iloc[ri - start].values):
-                    self._raw[(ri, ci)] = self._full(v)
-        else:
-            if self._df is None:
-                return
-            rows_data = [
-                [str(idx + 1)] + [self._fmt(v) for v in self._df.iloc[idx].values]
-                for idx in range(start, min(end, len(self._df)))
-            ]
-            dt.clear(columns=True)
-            self._col_keys = dt.add_columns("#", *self._col_names)
-            self._row_keys = list(dt.add_rows(rows_data))
+        rows_data = [
+            [str(idx + 1)] + [self._fmt(v) for v in self._df.iloc[idx].values]
+            for idx in range(start, min(end, len(self._df)))
+        ]
+        dt.clear(columns=True)
+        self._col_keys = dt.add_columns("#", *self._col_names)
+        self._row_keys = list(dt.add_rows(rows_data))
 
     def _get_row_range(self, start: int, end: int) -> pd.DataFrame:
         if self._zst_reader is not None:
@@ -1509,7 +1580,7 @@ class ParquetReaderApp(App[None]):
             if self._filter_active:
                 parts.append("FILTERED")
             parts.append(f"{len(self._edited)} edit(s)")
-            if self._df is not None and col - 1 < len(self._df.columns):
+            if not self._lazy and self._df is not None and col - 1 < len(self._df.columns):
                 col_dtype = self._types.get(col_name, "")
                 if any(t in col_dtype for t in ("int", "float")):
                     series = self._filter_df[col_name] if self._filter_active and self._filter_df is not None else self._df[col_name]
@@ -1541,8 +1612,10 @@ class ParquetReaderApp(App[None]):
         if self._lazy and self._dt is not None:
             row = self._dt.cursor_row or 0
             if row >= self._dt.row_count - 1 and self._view_offset + self._dt.row_count < self._num_rows:
+                self._saved_cursor_col = self._dt.cursor_column or 0
                 self._view_offset += self._visible_rows
                 self._refetch_visible()
+                self.call_later(self._position_cursor_down)
                 return
         self._dt.move_cursor(row=(self._dt.cursor_row or 0) + 1)
         self._on_cursor_moved()
@@ -1551,11 +1624,30 @@ class ParquetReaderApp(App[None]):
         if self._lazy and self._dt is not None:
             row = self._dt.cursor_row or 0
             if row == 0 and self._view_offset > 0:
+                self._saved_cursor_col = self._dt.cursor_column or 0
                 self._view_offset = max(0, self._view_offset - self._visible_rows)
                 self._refetch_visible()
-                self._dt.move_cursor(row=self._dt.row_count - 1)
+                self.call_later(self._position_cursor_up)
                 return
         self._dt.move_cursor(row=(self._dt.cursor_row or 0) - 1)
+        self._on_cursor_moved()
+
+    def _position_cursor_down(self) -> None:
+        try:
+            self._dt.move_cursor(row=0)
+            if self._saved_cursor_col is not None:
+                self._dt.move_cursor(column=self._saved_cursor_col)
+        except Exception:
+            pass
+        self._on_cursor_moved()
+
+    def _position_cursor_up(self) -> None:
+        try:
+            self._dt.move_cursor(row=self._dt.row_count - 1)
+            if self._saved_cursor_col is not None:
+                self._dt.move_cursor(column=self._saved_cursor_col)
+        except Exception:
+            pass
         self._on_cursor_moved()
 
     def action_left(self) -> None:
@@ -1612,29 +1704,34 @@ class ParquetReaderApp(App[None]):
         self._update_status()
 
     def _refetch_visible(self) -> None:
-        if not self._lazy or self._dt is None:
-            return
-        start = self._view_offset
-        end = start + self._visible_rows
-        if self._zst_reader is not None:
-            self._render_zst_visible_rows(start, end)
-        else:
-            self._render_visible_rows(start, end)
-        self._update_row_labels()
+        try:
+            if not self._lazy or self._dt is None:
+                return
+            start = self._view_offset
+            end = start + self._visible_rows
+            if self._zst_reader is not None:
+                self._render_zst_visible_rows(start, end)
+            else:
+                self._render_lazy_page(start, end)
+        except Exception:
+            pass
 
     def _update_row_labels(self) -> None:
-        if self._dt is None or not self._lazy:
-            return
-        for ri in range(self._dt.row_count):
-            if ri >= len(self._row_keys):
-                break
-            rkey = self._row_keys[ri]
-            label = self._view_offset + ri + 1
-            try:
-                self._dt.labeled_row(rkey, str(label))
-            except Exception:
-                pass
-        self._dt.refresh()
+        try:
+            if self._dt is None or not self._lazy:
+                return
+            for ri in range(self._dt.row_count):
+                if ri >= len(self._row_keys):
+                    break
+                rkey = self._row_keys[ri]
+                label = self._view_offset + ri + 1
+                try:
+                    self._dt.labeled_row(rkey, str(label))
+                except Exception:
+                    pass
+            self._dt.refresh()
+        except Exception:
+            pass
 
     def _update_footer_shelf(self) -> None:
         if hasattr(self, '_footer_shelf') and self._footer_shelf is not None:
@@ -1649,7 +1746,7 @@ class ParquetReaderApp(App[None]):
                                         "Tab1", "Tab2", "Tab3", "Tab4", "Tab5",
                                         "Tab6", "Tab7", "Tab8", "Tab9")]
             edit = [fmt(b) for b in self.BINDINGS
-                    if b.description in ("Edit", "Append", "View", "Yank", "Save", "Export",
+                    if b.description in ("Edit", "Append", "View", "Yank", "Save", "SaveIn", "Export",
                                          "Open", "AddRow", "DelRow", "Sort", "Schema",
                                          "Search", "Next", "Prev", "Filter", "HideCol",
                                          "Stats", "SQL", "Quit")]
@@ -1722,19 +1819,29 @@ class ParquetReaderApp(App[None]):
     def _edit_callback(self, result: bool) -> None:
         self._update_status()
 
-    def action_save(self) -> None:
+    async def action_save(self) -> None:
+        await self._do_save(False)
+
+    def action_save_in_place(self) -> None:
+        asyncio.create_task(self._do_save(True))
+
+    async def _do_save(self, in_place: bool = False) -> None:
         if not self._edited and not self._deleted_rows:
             self.notify("[green]No changes to save.[/green]")
             return
+        self.notify("[yellow]Loading data for save...[/yellow]")
+        await asyncio.sleep(0)
         if self._zst_reader is not None:
             df = self._zst_reader.get_row_range(0, self._num_rows)
         elif self._lazy:
-            df = pq.read_table(str(self._path)).to_pandas() if self._parquet_reader is not None else None
+            df = self._parquet_reader.get_row_range(0, self._num_rows) if self._parquet_reader is not None else None
         else:
             df = self._df.copy() if self._df is not None else None
         if df is None:
             self.notify("[red]Cannot save: no data loaded.[/red]")
             return
+        self.notify("[yellow]Applying edits...[/yellow]")
+        await asyncio.sleep(0)
         if self._deleted_rows:
             df = df.drop(index=list(self._deleted_rows)).reset_index(drop=True)
         for (ri, ci), nv in self._edited.items():
@@ -1745,12 +1852,19 @@ class ParquetReaderApp(App[None]):
                 df.iloc[ri, ci_actual] = cv
             except (ValueError, TypeError, IndexError):
                 pass
+        await asyncio.sleep(0)
         if _is_zst_file(str(self._path)):
-            out = self._path.with_suffix(".edited.jsonl")
+            if in_place:
+                out = self._path
+            else:
+                out = self._path.with_suffix(".edited.jsonl")
             df.to_json(str(out), orient="records", lines=True, force_ascii=False)
             self.notify(f"[green]Saved JSONL to {out.name}[/green]")
         else:
-            out = self._path.with_stem(self._path.stem + "_edited")
+            if in_place:
+                out = self._path
+            else:
+                out = self._path.with_stem(self._path.stem + "_edited")
             pq.write_table(pa.Table.from_pandas(df), str(out))
             self.notify(f"[green]Saved to {out.name}[/green]")
         self._edited.clear()
@@ -1775,13 +1889,15 @@ class ParquetReaderApp(App[None]):
     def action_export(self) -> None:
         self.push_screen(ExportScreen(), callback=self._do_export)
 
-    def _do_export(self, fmt: str | None) -> None:
+    async def _do_export(self, fmt: str | None) -> None:
         if fmt is None:
             return
+        self.notify("[yellow]Loading data for export...[/yellow]")
+        await asyncio.sleep(0)
         if self._zst_reader is not None:
             df = self._zst_reader.get_row_range(0, self._num_rows)
         elif self._lazy and self._parquet_reader is not None:
-            df = pq.read_table(str(self._path)).to_pandas()
+            df = self._parquet_reader.get_row_range(0, self._num_rows)
         else:
             df = self._df.copy() if self._df is not None else None
         if df is None:
@@ -1795,6 +1911,7 @@ class ParquetReaderApp(App[None]):
                 df.iloc[ri, ci_actual] = cv
             except (ValueError, TypeError, IndexError):
                 pass
+        await asyncio.sleep(0)
         stem = self._path.stem if self._path else "export"
         if fmt == "csv":
             out = self._path.parent / f"{stem}.csv"
@@ -1913,7 +2030,7 @@ class ParquetReaderApp(App[None]):
     def action_search(self) -> None:
         self.push_screen(SearchScreen(self._num_rows), callback=self._on_search_result)
 
-    def _on_search_result(self, result: Optional[dict]) -> None:
+    async def _on_search_result(self, result: Optional[dict]) -> None:
         if result is None:
             self._dt.focus()
             return
@@ -1924,33 +2041,60 @@ class ParquetReaderApp(App[None]):
         self._search_matches = []
         self._search_cursor = -1
         if self._lazy:
-            self._do_search_lazy(pattern, start, end)
+            asyncio.create_task(self._do_search_lazy_async(pattern, start, end))
         else:
             self._do_search_full(pattern, start, end)
 
-    def _do_search_lazy(self, pattern: str, start: int, end: int) -> None:
-        if self._zst_reader is None:
+    async def _do_search_lazy_async(self, pattern: str, start: int, end: int) -> None:
+        reader = self._zst_reader if self._zst_reader is not None else self._parquet_reader
+        if reader is None:
             self.notify("[yellow]No data to search.[/yellow]")
             self._dt.focus()
             return
         pattern_lower = pattern.lower()
-        chunk_size = 1000
+        chunk_size = 2000
+        col_names = self._all_columns if self._zst_reader is not None else self._col_names
+        total = end - start
+        self.notify(f"[yellow]Searching {total} rows for '{pattern}'...[/yellow]")
+        await asyncio.sleep(0)
+        scanned = 0
         for row_start in range(start, end, chunk_size):
             row_end = min(row_start + chunk_size, end)
-            df_chunk = self._zst_reader.get_row_range(row_start, row_end)
+            if hasattr(reader, 'get_row_range_async'):
+                df_chunk = await reader.get_row_range_async(row_start, row_end)
+            else:
+                df_chunk = reader.get_row_range(row_start, row_end)
             for ri in range(len(df_chunk)):
                 abs_row = row_start + ri
-                for ci, col_name in enumerate(self._col_names):
+                for ci, col_name in enumerate(col_names):
                     if ci < len(df_chunk.columns):
                         val = df_chunk.iloc[ri, ci]
-                        matched = False
-                        if ParquetReaderApp._is_container(val):
-                            if val.size > 0 and pattern_lower in str(val).lower():
-                                matched = True
-                        elif val is not None and not pd.isna(val):
-                            if pattern_lower in str(val).lower():
-                                matched = True
-                        if matched:
+                        if self._search_match_cell(val, pattern_lower):
+                            self._search_matches.append((abs_row, ci))
+            scanned += len(df_chunk)
+            pct = int(scanned * 100 / total)
+            self.notify(f"[yellow]Searching: {pct}% ({len(self._search_matches)} matches)[/yellow]")
+            await asyncio.sleep(0)
+        self._finalize_search(pattern, total)
+
+    def _do_search_lazy(self, pattern: str, start: int, end: int) -> None:
+        reader = self._zst_reader if self._zst_reader is not None else self._parquet_reader
+        if reader is None:
+            self.notify("[yellow]No data to search.[/yellow]")
+            self._dt.focus()
+            return
+        pattern_lower = pattern.lower()
+        chunk_size = 2000
+        col_names = self._all_columns if self._zst_reader is not None else self._col_names
+        for row_start in range(start, end, chunk_size):
+            row_end = min(row_start + chunk_size, end)
+            df_chunk = reader.get_row_range(row_start, row_end)
+            for ri in range(len(df_chunk)):
+                abs_row = row_start + ri
+                for ci, col_name in enumerate(col_names):
+                    if ci < len(df_chunk.columns):
+                        val = df_chunk.iloc[ri, ci]
+                        if self._search_match_cell(val, pattern_lower):
                             self._search_matches.append((abs_row, ci))
         self._finalize_search(pattern, end - start)
 
@@ -1967,16 +2111,25 @@ class ParquetReaderApp(App[None]):
             for ci, col_name in enumerate(self._col_names):
                 if ci < len(df.columns):
                     val = df.iloc[abs_row, ci]
-                    matched = False
-                    if ParquetReaderApp._is_container(val):
-                        if val.size > 0 and pattern_lower in str(val).lower():
-                            matched = True
-                    elif val is not None and not pd.isna(val):
-                        if pattern_lower in str(val).lower():
-                            matched = True
-                    if matched:
+                    if self._search_match_cell(val, pattern_lower):
                         self._search_matches.append((abs_row, ci))
         self._finalize_search(pattern, end - start)
+
+    @staticmethod
+    def _search_match_cell(val, pattern_lower: str) -> bool:
+        if ParquetReaderApp._is_container(val):
+            try:
+                if val.size > 0 and pattern_lower in str(val).lower():
+                    return True
+            except (ValueError, TypeError):
+                if pattern_lower in str(val).lower():
+                    return True
+        elif val is not None:
+            try:
+                return not pd.isna(val) and pattern_lower in str(val).lower()
+            except (ValueError, TypeError):
+                return pattern_lower in str(val).lower()
+        return False
 
     def _finalize_search(self, pattern: str, searched_range: int) -> None:
         if self._search_matches:
@@ -1987,6 +2140,7 @@ class ParquetReaderApp(App[None]):
             self._highlight_matches_in_view()
             self._show_search_bar(pattern, len(self._search_matches))
             self._dt.focus()
+            self.notify(f"[green]{len(self._search_matches)} matches for '{pattern}'[/green]")
         else:
             self.notify(f"[yellow]No matches found in {searched_range} rows.[/yellow]")
             self._dt.focus()
@@ -2016,6 +2170,7 @@ class ParquetReaderApp(App[None]):
             self._search_bar = bar
         except Exception:
             label = Label(f"/{pattern}  {count} matches  n/N navigate", id="search-bar")
+            label.styles.visibility = "visible"
             self.mount(label)
             self._search_bar = label
 
@@ -2088,11 +2243,17 @@ class ParquetReaderApp(App[None]):
             if self._filter_active:
                 self._filter_active = False
                 self._filter_df = None
-                if self._df is not None:
+                if self._lazy:
+                    self._view_offset = 0
+                    self._refetch_visible()
+                elif self._df is not None:
                     await self._populate_table(self._df)
                 self._update_status()
             return
         df = self._df
+        if df is None:
+            if self._lazy:
+                df = self._get_row_range(0, self._num_rows)
         if df is None:
             return
         try:
@@ -2129,7 +2290,8 @@ class ParquetReaderApp(App[None]):
                 filtered = df[df[col].notna()]
             self._filter_active = True
             self._filter_df = filtered
-            await self._populate_table(filtered)
+            if not self._lazy:
+                await self._populate_table(filtered)
             self._update_status()
         except Exception as e:
             self.notify(f"[red]Filter error: {e}[/red]")
@@ -2141,6 +2303,8 @@ class ParquetReaderApp(App[None]):
         ri, ci, display, rk, ck = info
         col_name = ck
         df = self._filter_df if self._filter_active else self._df
+        if df is None and self._lazy:
+            df = self._get_row_range(0, self._num_rows)
         if df is None or col_name not in df.columns:
             return
         series = df[col_name]
@@ -2219,6 +2383,8 @@ class ParquetReaderApp(App[None]):
             self._sort_col = col_name
             self._sort_asc = True
         df = self._df
+        if df is None and self._lazy:
+            df = self._get_row_range(0, self._num_rows)
         if df is None:
             return
         df = df.copy()
@@ -2234,25 +2400,47 @@ class ParquetReaderApp(App[None]):
             df = df.sort_values(col_name, ascending=self._sort_asc)
         df = df.reset_index(drop=True)
         self._df = df
-        await self._populate_table(df)
+        if not self._lazy:
+            await self._populate_table(df)
         self._update_status()
         self.notify(f"[cyan]Sorted[/cyan] {col_name} {'↑' if self._sort_asc else '↓'}")
 
     def action_delete_row(self) -> None:
         dt = self._dt
         if dt is None or dt.cursor_row is None:
+            self.notify("[red]No cursor position for delete[/red]")
             return
         row = dt.cursor_row
-        self._deleted_rows.add(row)
+        # Walk from view_offset, skipping deleted rows, to find abs_row at cursor
+        if self._lazy:
+            abs_row = self._view_offset
+            while abs_row in self._deleted_rows:
+                abs_row += 1
+            for _ in range(row):
+                abs_row += 1
+                while abs_row in self._deleted_rows:
+                    abs_row += 1
+        else:
+            abs_row = row
+        self._deleted_rows.add(abs_row)
         try:
             rkey = self._row_keys[row] if row < len(self._row_keys) else None
             if rkey is not None:
-                self._dt.hide_row(rkey)
-        except Exception:
-            pass
-        self.notify(f"[red]Marked row {row+1}[/red] for deletion")
+                self._dt.remove_row(rkey)
+                self._row_keys = sorted(self._dt._row_locations._forward, key=lambda k: self._dt._row_locations.get(k))
+                return
+        except Exception as e:
+            self.notify(f"[red]Delete error: {e}[/red]")
+        self.notify(f"[red]Deleted row {abs_row + 1}[/red]")
 
     async def action_add_row(self) -> None:
+        if self._col_names is None or not self._col_names:
+            return
+        if self._lazy:
+            self._num_rows += 1
+            self.notify(f"[green]Added row {self._num_rows} (will be saved on 'w')[/green]")
+            self._update_status()
+            return
         if self._df is None:
             return
         new_row = pd.DataFrame({c: [pd.NA] for c in self._col_names})
